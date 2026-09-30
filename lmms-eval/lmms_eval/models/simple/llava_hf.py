@@ -1,6 +1,7 @@
 import warnings
 from typing import List, Optional, Tuple, Union
 import os
+import re
 import numpy as np
 import PIL
 import torch
@@ -19,6 +20,20 @@ from lmms_eval import utils
 from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
+from lmms_eval.models.model_utils.kv_carryover import (
+    ChatAdapter,
+    carryover_enabled,
+    collapse_placeholders,
+    run_conversation,
+    score_references_carryover,
+)
+from lmms_eval.models.model_utils.reference_scoring import (
+    ReferenceScores,
+    forced_decode_nll,
+    ppl_on_model_history,
+    reference_answers,
+    score_references,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -409,5 +424,189 @@ class LlavaHf(lmms):
         pbar.close()
         return res
 
-    def generate_until_multi_round(self, requests) -> List[str]:
-        raise NotImplementedError("TODO: Implement multi-round generation for LLaVAHF")
+    def generate_until_multi_round(self, requests) -> List[Tuple[str, ...]]:
+        """Multi-round generation that keeps a real chat history.
+
+        Round 0 sends the task context with the doc's visuals. After each round the task's
+        `doc_to_text(doc, previous_output=..., round_idx=...)` returns
+        `(visuals, context, terminal, previous_output, round_info)`:
+          * a list `context` of {"role", "content"} messages is the full chat history; the round-0
+            visuals are attached to its first user message (e.g. ConvBench);
+          * a string `context` is sent as a fresh single-turn prompt with the returned visuals.
+        By default (MULTI_TURN_KV_CARRYOVER=1) the KV cache is carried from one turn to the next: later turns
+        prefill only their new tokens on top of the (TGV-KV compressed) cache, see
+        `lmms_eval.models.model_utils.kv_carryover`. With MULTI_TURN_KV_CARRYOVER=0 every turn is a separate
+        `generate` call over the full history.
+        Returns one tuple of per-round answers per request. If the task's `doc_to_text` accepts
+        `reference_round`, the tuple ends with a dict of reference NLLs for perplexity
+        (see `lmms_eval.models.model_utils.reference_scoring`).
+        """
+        res = []
+        pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="Model Responding")
+        for request in requests:
+            context, gen_kwargs, doc_to_visual, doc_to_text, doc_id, task, split = request.args
+            doc = self.task_dict[task][split][doc_id]
+            doc_visuals = self.flatten([doc_to_visual(doc)])
+            gen_kwargs = {k: v for k, v in gen_kwargs.items() if k != "until"}
+            max_tokens = gen_kwargs.get("max_new_tokens", 1024)
+            if carryover_enabled():
+                adapter = self._carryover_adapter(doc_visuals, gen_kwargs)
+                if ppl_on_model_history():
+                    outputs, reference_scores = run_conversation(self.model, adapter, doc, context, doc_to_text, max_tokens, references=reference_answers(doc_to_text, doc))
+                else:
+                    outputs, _ = run_conversation(self.model, adapter, doc, context, doc_to_text, max_tokens)
+                    reference_scores = score_references_carryover(self.model, adapter, doc, doc_to_text, max_tokens)
+            else:
+                outputs, reference_scores = self._multi_round_reencode(doc, context, doc_visuals, doc_to_text, gen_kwargs)
+            result = tuple(outputs) + ((reference_scores,) if reference_scores else ())
+            res.append(result)
+            self.cache_hook.add_partial("generate_until_multi_round", (request.args[0], gen_kwargs), result)
+            pbar.update(1)
+        pbar.close()
+        return res
+
+    def _multi_round_reencode(self, doc, context, doc_visuals, doc_to_text, gen_kwargs):
+        """One `generate` call per turn over the full history (MULTI_TURN_KV_CARRYOVER=0)."""
+        visuals = doc_visuals
+        messages = [{"role": "user", "content": context}]
+        outputs, round_info = [], None
+        tokenize = lambda text: self.tokenizer(text, add_special_tokens=False)["input_ids"]  # noqa: E731
+        max_tokens = gen_kwargs.get("max_new_tokens", 1024)
+        own = ppl_on_model_history()
+        scores = ReferenceScores(reference_answers(doc_to_text, doc) if own else [], tokenize, max_tokens)
+        while True:
+            # PPL_HISTORY=model: reference k after the same history answer k is generated from
+            scores.add(len(outputs) + 1, lambda ids, m=messages, v=visuals: forced_decode_nll(self.model, self._chat_inputs(m, v), ids, self.eot_token_id, self.eot_token_id))
+            outputs.append(self._generate_chat(messages, visuals, gen_kwargs))
+            new_visuals, context, terminal, _, round_info = doc_to_text(doc, previous_output=list(outputs), round_idx=len(outputs), previous_round_info=round_info)
+            if terminal:
+                break
+            if isinstance(context, list):
+                messages = context
+            else:
+                messages = [{"role": "user", "content": context}]
+                visuals = self.flatten([new_visuals]) if new_visuals else visuals
+        if own:
+            return outputs, scores.result()
+        reference_scores = score_references(
+            doc,
+            doc_to_text,
+            tokenize=tokenize,
+            score=lambda msgs, ids: forced_decode_nll(self.model, self._chat_inputs(msgs, doc_visuals), ids, self.eot_token_id, self.eot_token_id),
+            max_tokens=max_tokens,
+        )
+        return outputs, reference_scores
+
+    def _carryover_adapter(self, visuals, gen_kwargs):
+        """What the KV carry-over conversation loop needs from LLaVA."""
+        temperature = gen_kwargs.get("temperature", 0) or 0
+        do_sample = temperature > 0
+        return ChatAdapter(
+            chat_text=lambda messages: self._chat_text(messages, visuals),
+            first_inputs=lambda messages: self._chat_inputs(messages, visuals),
+            tokenize=lambda text: self.tokenizer(text)["input_ids"],
+            tokenize_answer=lambda text: self.tokenizer(text, add_special_tokens=False)["input_ids"],
+            decode=lambda ids: self.tokenizer.decode(ids, skip_special_tokens=True).strip(),
+            decode_prompt=lambda ids: collapse_placeholders(self.tokenizer.decode(ids), DEFAULT_IMAGE_TOKEN),
+            generate_kwargs=dict(
+                do_sample=do_sample,
+                temperature=temperature if do_sample else None,
+                top_p=gen_kwargs.get("top_p", None),
+                num_beams=gen_kwargs.get("num_beams", 1),
+                max_new_tokens=gen_kwargs.get("max_new_tokens", 1024),
+                use_cache=self.use_cache,
+                pad_token_id=self.eot_token_id,
+                eos_token_id=self.eot_token_id,
+            ),
+            eos_ids={self.eot_token_id},
+            pad_id=self.eot_token_id,
+            image_token_ids={self.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)},
+        )
+
+    def _chat_text(self, messages, visuals):
+        """Prompt text for a chat history ending in a user turn (image placeholders not yet expanded).
+
+        Checkpoints whose processor ships a chat template (e.g. llava-hf/llava-1.5-*-hf) get structured
+        {"type": "image"/"text"} content, as lmms-eval's chat-mode LlavaHf renders them; such templates
+        silently drop plain-string content. Other checkpoints use the plain-string (Vicuna) path.
+        """
+        if self.chat_template is None and getattr(self._image_processor, "chat_template", None):
+            text = self._image_processor.apply_chat_template(self._structured_messages(messages, visuals), tokenize=False, add_generation_prompt=True)
+        else:
+            text = self._string_chat_prompt(messages, visuals)
+        question = messages[-1]["content"].replace(DEFAULT_IMAGE_TOKEN, "").strip()[:50]
+        if question and question not in text:
+            raise ValueError(f"The chat template dropped the user message; rendered prompt: {text[:300]!r}")
+        return text
+
+    def _chat_inputs(self, messages, visuals):
+        """Model inputs for a chat history ending in a user turn, with `visuals` attached to the first user message."""
+        text = self._chat_text(messages, visuals)
+        if not visuals:
+            return self.tokenizer(text, return_tensors="pt").to(self._device)
+        if isinstance(visuals[0], str):
+            return self._image_processor(videos=[self.load_video(visuals, self.max_frames_num)], text=text, return_tensors="pt").to(self._device, self.model.dtype)
+        return self._image_processor(images=visuals, text=text, return_tensors="pt").to(self._device, self.model.dtype)
+
+    @staticmethod
+    def _structured_messages(messages, visuals):
+        """Chat messages with typed content parts; the visuals go in the first user message, before its text."""
+        media = [{"type": "video"}] if visuals and isinstance(visuals[0], str) else [{"type": "image"}] * len(visuals)
+        structured, attached = [], False
+        for m in messages:
+            content = [{"type": "text", "text": m["content"].replace(DEFAULT_IMAGE_TOKEN, "")}]
+            if m["role"] == "user" and not attached:
+                content, attached = media + content, True
+            structured.append({"role": m["role"], "content": content})
+        return structured
+
+    def _string_chat_prompt(self, messages, visuals):
+        """Prompt from plain-string messages, with image/video tokens prepended to the first user message."""
+        messages = [dict(m) for m in messages]
+        if visuals and not any(DEFAULT_IMAGE_TOKEN in m["content"] or DEFAULT_VIDEO_TOKEN in m["content"] for m in messages):
+            is_video = isinstance(visuals[0], str)
+            token = DEFAULT_VIDEO_TOKEN if is_video else DEFAULT_IMAGE_TOKEN
+            first_user = next(m for m in messages if m["role"] == "user")
+            first_user["content"] = f"{' '.join([token] * (1 if is_video else len(visuals)))}\n{first_user['content']}"
+
+        if self.chat_template is not None:
+            self.tokenizer.chat_template = self.chat_template
+        elif self.tokenizer.chat_template is None:
+            self.tokenizer.chat_template = VICUNA_CHAT_TEMPLATE
+        return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    def _generate_chat(self, messages, visuals, gen_kwargs) -> str:
+        """Generate one assistant reply for a chat history, attaching `visuals` to the first user message.
+
+        Errors are raised, not swallowed: a systematic failure (e.g. a prompt/template mismatch) would otherwise
+        score every conversation on empty answers.
+        """
+        inputs = self._chat_inputs(messages, visuals)
+
+
+
+
+        if os.environ.get("CONVBENCH_DEBUG_PROMPTS"):
+            ids = inputs["input_ids"][0]
+            image_id = self.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
+            n_image = int((ids == image_id).sum())
+            turn = sum(m["role"] == "user" for m in messages)
+            prompt = re.sub(r"(?:<image>\s*)+", f"<image x{n_image}> ", self.tokenizer.decode(ids, skip_special_tokens=False))
+            eval_logger.info(f"[turn {turn}] prompt tokens: {ids.numel()} = {n_image} image + {ids.numel() - n_image} text\n{prompt}")
+
+
+        temperature = gen_kwargs.get("temperature", 0) or 0
+        do_sample = temperature > 0
+        cont = self.model.generate(
+            **inputs,
+            do_sample=do_sample,
+            temperature=temperature if do_sample else None,
+            top_p=gen_kwargs.get("top_p", None),
+            num_beams=gen_kwargs.get("num_beams", 1),
+            max_new_tokens=gen_kwargs.get("max_new_tokens", 1024),
+            use_cache=self.use_cache,
+            pad_token_id=self.eot_token_id,
+            eos_token_id=self.eot_token_id,
+        )
+        cont = cont[:, inputs["input_ids"].shape[-1] :]
+        return self.tokenizer.batch_decode(cont, skip_special_tokens=True)[0].strip()

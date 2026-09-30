@@ -1,5 +1,6 @@
 import base64
 import re
+import os
 from io import BytesIO
 from typing import List, Optional, Tuple, Union
 
@@ -23,6 +24,20 @@ from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
 from lmms_eval.models.model_utils.reasoning_model_utils import (
     parse_reasoning_model_answer,
+)
+from lmms_eval.models.model_utils.kv_carryover import (
+    ChatAdapter,
+    carryover_enabled,
+    collapse_placeholders,
+    run_conversation,
+    score_references_carryover,
+)
+from lmms_eval.models.model_utils.reference_scoring import (
+    ReferenceScores,
+    forced_decode_nll,
+    ppl_on_model_history,
+    reference_answers,
+    score_references,
 )
 
 try:
@@ -361,5 +376,181 @@ class Qwen3_VL(lmms):
         pbar.close()
         return res
 
-    def generate_until_multi_round(self, requests) -> List[str]:
-        raise NotImplementedError("TODO: Implement multi-round generation")
+    def generate_until_multi_round(self, requests) -> List[Tuple[str, ...]]:
+        """Multi-round generation that keeps a real chat history.
+
+        Round 0 sends the task context with the doc's visuals. After each round the task's
+        `doc_to_text(doc, previous_output=..., round_idx=...)` returns
+        `(visuals, context, terminal, previous_output, round_info)`:
+          * a list `context` of {"role", "content"} messages is the full chat history; the round-0
+            visuals are attached to its first user message (e.g. ConvBench);
+          * a string `context` is sent as a fresh single-turn prompt with the returned visuals.
+        By default (MULTI_TURN_KV_CARRYOVER=1) the KV cache is carried from one turn to the next: later turns
+        prefill only their new tokens on top of the (TGV-KV compressed) cache, see
+        `lmms_eval.models.model_utils.kv_carryover`. With MULTI_TURN_KV_CARRYOVER=0 every turn is a separate
+        `generate` call over the full history.
+        Returns one tuple of per-round answers per request. If the task's `doc_to_text` accepts
+        `reference_round`, the tuple ends with a dict of reference NLLs for perplexity
+        (see `lmms_eval.models.model_utils.reference_scoring`).
+        """
+        res = []
+        pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="Model Responding")
+        for request in requests:
+            context, gen_kwargs, doc_to_visual, doc_to_text, doc_id, task, split = request.args
+            doc = self.task_dict[task][split][doc_id]
+            doc_visuals = doc_to_visual(doc) or []
+            until = gen_kwargs.get("until", [self.tokenizer.decode(self.eot_token_id)])
+            until = [u for u in ([until] if isinstance(until, str) else until) if u and u != "\n\n"]
+            max_tokens = gen_kwargs.get("max_new_tokens", 1024)
+            if carryover_enabled():
+                adapter = self._carryover_adapter(doc_visuals, gen_kwargs, until)
+                if ppl_on_model_history():
+                    outputs, reference_scores = run_conversation(self.model, adapter, doc, context, doc_to_text, max_tokens, references=reference_answers(doc_to_text, doc))
+                else:
+                    outputs, _ = run_conversation(self.model, adapter, doc, context, doc_to_text, max_tokens)
+                    reference_scores = score_references_carryover(self.model, adapter, doc, doc_to_text, max_tokens)
+            else:
+                outputs, reference_scores = self._multi_round_reencode(doc, context, doc_visuals, doc_to_text, gen_kwargs, until)
+            result = tuple(outputs) + ((reference_scores,) if reference_scores else ())
+            res.append(result)
+            self.cache_hook.add_partial("generate_until_multi_round", (request.args[0], gen_kwargs), result)
+            pbar.update(1)
+        pbar.close()
+        return res
+
+    def _multi_round_reencode(self, doc, context, doc_visuals, doc_to_text, gen_kwargs, until):
+        """One `generate` call per turn over the full history (MULTI_TURN_KV_CARRYOVER=0)."""
+        visuals = doc_visuals
+        messages = [{"role": "user", "content": context}]
+        outputs, round_info = [], None
+        tokenize = lambda text: self.tokenizer(text, add_special_tokens=False)["input_ids"]  # noqa: E731
+        max_tokens = gen_kwargs.get("max_new_tokens", 1024)
+        own = ppl_on_model_history()
+        scores = ReferenceScores(reference_answers(doc_to_text, doc) if own else [], tokenize, max_tokens)
+        while True:
+            # PPL_HISTORY=model: reference k after the same history answer k is generated from
+            scores.add(len(outputs) + 1, lambda ids, m=messages, v=visuals: forced_decode_nll(self.model, self._chat_inputs(m, v), ids, self.tokenizer.eos_token_id, self.tokenizer.pad_token_id))
+            outputs.append(self._generate_chat(messages, visuals, gen_kwargs, until))
+            new_visuals, context, terminal, _, round_info = doc_to_text(doc, previous_output=list(outputs), round_idx=len(outputs), previous_round_info=round_info)
+            if terminal:
+                break
+            if isinstance(context, list):
+                messages = context
+            else:
+                messages = [{"role": "user", "content": context}]
+                visuals = new_visuals or visuals
+        if own:
+            return outputs, scores.result()
+        reference_scores = score_references(
+            doc,
+            doc_to_text,
+            tokenize=tokenize,
+            score=lambda msgs, ids: forced_decode_nll(self.model, self._chat_inputs(msgs, doc_visuals), ids, self.tokenizer.eos_token_id, self.tokenizer.pad_token_id),
+            max_tokens=max_tokens,
+        )
+        return outputs, reference_scores
+
+    def _carryover_adapter(self, visuals, gen_kwargs, until):
+        """What the KV carry-over conversation loop needs from Qwen3-VL."""
+        temperature = gen_kwargs.get("temperature", 0) or 0
+        do_sample = temperature > 0
+        eos = self.model.generation_config.eos_token_id
+        eos_ids = {self.tokenizer.eos_token_id} | set(eos if isinstance(eos, list) else [eos] if eos is not None else [])
+
+        def decode(ids):
+            answer = self.processor.batch_decode([ids], skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+            for term in until:
+                answer = answer.split(term)[0]
+            return parse_reasoning_model_answer(answer).strip()
+
+        return ChatAdapter(
+            chat_text=lambda messages: self._chat_text(self._chat_messages(messages, visuals)),
+            first_inputs=lambda messages: self._chat_inputs(messages, visuals),
+            tokenize=lambda text: self.tokenizer(text)["input_ids"],
+            tokenize_answer=lambda text: self.tokenizer(text, add_special_tokens=False)["input_ids"],
+            decode=decode,
+            decode_prompt=lambda ids: collapse_placeholders(self.tokenizer.decode(ids), "<|image_pad|>"),
+            generate_kwargs=dict(
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
+                do_sample=do_sample,
+                temperature=temperature if do_sample else None,
+                top_p=gen_kwargs.get("top_p", None) if do_sample else None,
+                num_beams=gen_kwargs.get("num_beams", 1),
+                max_new_tokens=gen_kwargs.get("max_new_tokens", 128),
+                use_cache=self.use_cache,
+            ),
+            eos_ids=eos_ids,
+            pad_id=self.tokenizer.pad_token_id,
+            image_token_ids={self.tokenizer.convert_tokens_to_ids(t) for t in ("<|image_pad|>", "<|video_pad|>")},
+        )
+
+    def _chat_text(self, chat):
+        """Prompt text for a Qwen chat (image placeholders not yet expanded)."""
+        text = self.processor.apply_chat_template([chat], tokenize=False, add_generation_prompt=True)
+        return text[0] if isinstance(text, list) else text
+
+    def _chat_messages(self, messages, visuals):
+        """Qwen chat with typed content: system prompt first, `visuals` in the first user message."""
+        processed_visuals = []
+        for visual in visuals:
+            if isinstance(visual, str) and visual.endswith((".mp4", ".avi", ".mov")):
+                processed_visuals.append({"type": "video", "video": visual, "max_pixels": self.max_pixels, "min_pixels": self.min_pixels})
+            elif isinstance(visual, Image.Image):
+                processed_visuals.append({"type": "image", "image": visual, "max_pixels": self.max_pixels, "min_pixels": self.min_pixels})
+
+        chat = [{"role": "system", "content": self.system_prompt}]
+        first_user = True
+        for m in messages:
+            text = m["content"].replace("<image>", "")
+            if m["role"] == "user" and self.reasoning_prompt:
+                text = text.strip() + self.reasoning_prompt
+            content = [{"type": "text", "text": text}]
+            if m["role"] == "user" and first_user:
+                content = processed_visuals + content
+                first_user = False
+            chat.append({"role": m["role"], "content": content})
+        return chat
+
+    def _chat_inputs(self, messages, visuals):
+        """Model inputs for a chat history ending in a user turn, with `visuals` attached to the first user message."""
+        chat = self._chat_messages(messages, visuals)
+        text = self.processor.apply_chat_template([chat], tokenize=False, add_generation_prompt=True)
+        image_inputs, video_inputs = process_vision_info([chat], return_video_kwargs=False, image_patch_size=16, return_video_metadata=False)
+        if video_inputs is not None:
+            total_frames = video_inputs[0].shape[0]
+            indices = np.unique(np.append(np.linspace(0, total_frames - 1, self.max_num_frames, dtype=int), total_frames - 1))
+            video_inputs[0] = video_inputs[0][indices]
+        inputs = self.processor(text=text, images=image_inputs, videos=video_inputs, do_resize=False, return_tensors="pt")
+        return inputs.to("cuda") if self.device_map == "auto" else inputs.to(self.device)
+
+    def _generate_chat(self, messages, visuals, gen_kwargs, until) -> str:
+        """Generate one assistant reply for a chat history, attaching `visuals` to the first user message."""
+        inputs = self._chat_inputs(messages, visuals)
+
+
+        if os.environ.get("CONVBENCH_DEBUG_PROMPTS"):
+            ids = inputs["input_ids"][0]
+            vision_ids = [self.tokenizer.convert_tokens_to_ids(t) for t in ("<|image_pad|>", "<|video_pad|>")]
+            n_image = int(sum((ids == v).sum() for v in vision_ids))
+            turn = sum(m["role"] == "user" for m in messages)
+            prompt = re.sub(r"(?:<\|(?:image|video)_pad\|>)+", f"<image x{n_image}>", self.tokenizer.decode(ids, skip_special_tokens=False))
+            eval_logger.info(f"[turn {turn}] prompt tokens: {ids.numel()} = {n_image} image + {ids.numel() - n_image} text\n{prompt}")
+            
+        temperature = gen_kwargs.get("temperature", 0) or 0
+        do_sample = temperature > 0
+        cont = self.model.generate(
+            **inputs,
+            eos_token_id=self.tokenizer.eos_token_id,
+            pad_token_id=self.tokenizer.pad_token_id,
+            do_sample=do_sample,
+            temperature=temperature if do_sample else None,
+            top_p=gen_kwargs.get("top_p", None) if do_sample else None,
+            num_beams=gen_kwargs.get("num_beams", 1),
+            max_new_tokens=gen_kwargs.get("max_new_tokens", 128),
+            use_cache=self.use_cache,
+        )
+        answer = self.processor.batch_decode(cont[:, inputs.input_ids.shape[-1] :], skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        for term in until:
+            answer = answer.split(term)[0]
+        return parse_reasoning_model_answer(answer).strip()

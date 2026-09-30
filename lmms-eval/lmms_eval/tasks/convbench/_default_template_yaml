@@ -1,0 +1,17 @@
+include: _convbench_data_yaml
+test_split: test
+output_type: generate_until_multi_round
+process_docs: !function utils.convbench_process_docs
+doc_to_visual: !function utils.convbench_doc_to_visual
+doc_to_text: !function utils.convbench_doc_to_text
+doc_to_target: "reference_3"
+generation_kwargs:
+  # ConvBench answers are open-ended paragraphs. With TGV-KV, also export MAX_GENERATED_TOKENS>=1024,
+  # because utils/generate_patches.py stops decoding at that env value regardless of max_new_tokens.
+  max_new_tokens: 1024
+  temperature: 0
+  top_p: null
+  num_beams: 1
+  do_sample: false
+metadata:
+  version: 0.1

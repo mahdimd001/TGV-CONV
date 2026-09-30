@@ -30,6 +30,7 @@ class TGVKVCache:
         self.ratio = ratio
 
     def begin_online_prefill(self, input_ids):
+
         if input_ids is None:
             return False
 

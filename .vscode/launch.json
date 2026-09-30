@@ -1,0 +1,88 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug lmms_eval with Accelerate",
+            "type": "python",
+            "request": "launch",
+            "module": "accelerate.commands.launch",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "HF_HOME": "/lustre/hdd/LAS/jannesar-lab/msamani/.cache/huggingface",
+                "HF_DATASETS_CACHE": "/lustre/hdd/LAS/jannesar-lab/msamani/.cache/huggingface/datasets",
+                "TRANSFORMERS_CACHE": "/lustre/hdd/LAS/jannesar-lab/msamani/.cache/huggingface/hub",
+                "HF_HUB_CACHE": "/lustre/hdd/LAS/jannesar-lab/msamani/.cache/huggingface/hub",
+                "HF_TOKEN": "",
+                "CUDA_VISIBLE_DEVICES": "0",
+                "MODEL_TYPE": "llava-7B",
+                "MAX_GENERATED_TOKENS": "512",
+                "KV_CACHE_TYPE": "tgv_kv",
+                "PRUNE_RATIO": "0.8",
+                "CONVBENCH_GRADING": "none",
+                "CONVBENCH_DEBUG_PROMPTS": "1",
+                "MULTI_TURN_KV_CARRYOVER": "1",
+                "MULTI_TURN_DECODE_EVICTION": "1",
+                "CONVBENCH_TEXT_METRICS" : "0"
+            },
+            "args": [
+                "--num_processes=1",
+                "-m",
+                "lmms_eval",
+                "--model",
+                "llava_hf",
+                "--model_args",
+                "pretrained=llava-hf/llava-1.5-7b-hf,attn_implementation=eager,device_map=cuda",
+                "--tasks",
+                "convbench",
+                "--batch_size",
+                "1",
+                "--log_samples",
+                "--output_path",
+                "./logs/",
+                "--limit",
+                "10"
+
+            ]
+        }
+    ]
+}
+
+// {
+//     "version": "0.2.0",
+//     "configurations": [
+//         {
+//             "name": "Debug lmms_eval with Accelerate",
+//             "type": "python",
+//             "request": "launch",
+//             "module": "accelerate.commands.launch",
+//             "console": "integratedTerminal",
+//             "justMyCode": false,
+//             "env": {
+//                 "CUDA_VISIBLE_DEVICES": "0",
+//                 "MODEL_TYPE": "phi-3.5-vision",
+//                 "MAX_GENERATED_TOKENS": "32",
+//                 "KV_CACHE_TYPE": "none",
+//                 "PRUNE_RATIO": "0.9"
+//             },
+//             "args": [
+//                 "--num_processes=1",
+//                 "-m",
+//                 "lmms_eval",
+//                 "--model",
+//                 "phi3v",
+//                 "--model_args",
+//                 "model_id_name=microsoft/Phi-3.5-vision-instruct,attn_implementation=eager",
+//                 "--tasks",
+//                 "chartqa",
+//                 "--batch_size",
+//                 "1",
+//                 "--log_samples",
+//                 "--output_path",
+//                 "./logs/",
+//                 "--verbosity",
+//                 "DEBUG",
+//             ]
+//         }
+//     ]
+// }

@@ -1,0 +1,5 @@
+# Data location for the ConvBench tasks. prepare_convbench.py rewrites this file with an absolute path.
+dataset_path: json
+dataset_kwargs:
+  data_files:
+    test: "/lustre/hdd/LAS/jannesar-lab/msamani/TGV-CONV/lmms-eval/lmms_eval/tasks/convbench/convbench.jsonl"

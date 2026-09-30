@@ -3,6 +3,7 @@ import os
 from colorama import Fore, Style
 
 from .tgv_kv import TGVKVCache
+from .tgv_kv_multiturn import MultiTurnTGVKVCache
 
 
 def get_kv_cache(
@@ -14,6 +15,8 @@ def get_kv_cache(
     prune_ratio=0.2,
     layer_num=36,
     model_name="llava-v1.5-7b",
+    multi_turn=False,
+    decode_eviction=False,
 ):
     first_call = not hasattr(get_kv_cache, "_printed")
     if first_call:
@@ -53,7 +56,10 @@ def get_kv_cache(
     if method in ("tgv_kv", "tgv-kv", "tgvkv"):
         if first_call:
             print(f"{Fore.GREEN}+++ Using TGV-KV Cache +++{Style.RESET_ALL}")
-        return TGVKVCache(
+        # multi_turn: one cache object for a whole conversation, carried across turns (see tgv_kv_multiturn.py)
+        cache_cls, extra = (MultiTurnTGVKVCache, {"decode_eviction": decode_eviction}) if multi_turn else (TGVKVCache, {})
+        return cache_cls(
+            **extra,
             image_token_id=image_token_id,
             start_size=start_size,
             recent_size=recent_size,

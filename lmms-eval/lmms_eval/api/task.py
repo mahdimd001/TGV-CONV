@@ -1680,6 +1680,9 @@ class ConfigurableMessagesTask(ConfigurableTask):
             return self.config.doc_to_messages
 
     def construct_requests(self, doc_id: int, ctx: str, **kwargs) -> Union[List[Instance], Instance]:
+        if self.OUTPUT_TYPE == "generate_until_multi_round":
+            # Multi-round tasks drive their own per-round prompts via doc_to_text, so use the standard request format.
+            return super().construct_requests(doc_id, ctx, **kwargs)
         split = kwargs.get("metadata").get("split")
         # kwargs.pop("split")
         assert self.OUTPUT_TYPE == "generate_until", "Currently messages is used for generation only"

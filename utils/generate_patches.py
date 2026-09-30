@@ -93,7 +93,12 @@ def _sample(
     else:
         is_prefill = True
 
-    kv_cache_criteria = get_kv_cache(os.environ.get("KV_CACHE_TYPE", None), prune_ratio=float(os.environ.get("PRUNE_RATIO", 0.9)))
+    # A multi-turn conversation carrying its KV cache across turns keeps one TGV-KV state for all its turns
+    session = getattr(self, "_tgv_kv_session", None)
+    if session is not None:
+        kv_cache_criteria = session.criteria
+    else:
+        kv_cache_criteria = get_kv_cache(os.environ.get("KV_CACHE_TYPE", None), prune_ratio=float(os.environ.get("PRUNE_RATIO", 0.9)))
 
     num_generated_tokens = 0
     max_generated_tokens = int(os.environ.get("MAX_GENERATED_TOKENS", "10000"))

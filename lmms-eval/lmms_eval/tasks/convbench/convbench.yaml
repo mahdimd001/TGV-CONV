@@ -1,0 +1,59 @@
+# ConvBench main setting (S): the model sees its own earlier answers in the chat history.
+include: _default_template_yaml
+task: "convbench"
+process_results: !function utils.convbench_process_results
+lmms_eval_specific_kwargs:
+  default:
+    n_ref_turns: 0
+metric_list:
+  # LLM judge (skipped with CONVBENCH_GRADING=none)
+  - metric: convbench_R1
+    aggregation: !function utils.convbench_aggregate_r1
+    higher_is_better: true
+  - metric: convbench_R2
+    aggregation: !function utils.convbench_aggregate_r2
+    higher_is_better: true
+  - metric: convbench_S0
+    aggregation: !function utils.convbench_aggregate_score
+    higher_is_better: true
+  - metric: convbench_S1
+    aggregation: !function utils.convbench_aggregate_score
+    higher_is_better: true
+  - metric: convbench_S2
+    aggregation: !function utils.convbench_aggregate_score
+    higher_is_better: true
+  - metric: convbench_S3
+    aggregation: !function utils.convbench_aggregate_score
+    higher_is_better: true
+  # Reference-based text metrics, x100 (skipped with CONVBENCH_TEXT_METRICS=0)
+  - metric: convbench_BLEU1
+    aggregation: !function utils.convbench_bleu1
+    higher_is_better: true
+  - metric: convbench_BLEU2
+    aggregation: !function utils.convbench_bleu2
+    higher_is_better: true
+  - metric: convbench_BLEU3
+    aggregation: !function utils.convbench_bleu3
+    higher_is_better: true
+  - metric: convbench_BLEU4
+    aggregation: !function utils.convbench_bleu4
+    higher_is_better: true
+  - metric: convbench_METEOR
+    aggregation: !function utils.convbench_meteor
+    higher_is_better: true
+  - metric: convbench_ROUGE_L
+    aggregation: !function utils.convbench_rouge_l
+    higher_is_better: true
+  # Perplexity of the reference answers under the (compressed) model, overall and per turn (skipped with CONVBENCH_PPL=0)
+  - metric: convbench_PPL
+    aggregation: !function utils.convbench_aggregate_ppl
+    higher_is_better: false
+  - metric: convbench_PPL_turn1
+    aggregation: !function utils.convbench_aggregate_ppl_turn1
+    higher_is_better: false
+  - metric: convbench_PPL_turn2
+    aggregation: !function utils.convbench_aggregate_ppl_turn2
+    higher_is_better: false
+  - metric: convbench_PPL_turn3
+    aggregation: !function utils.convbench_aggregate_ppl_turn3
+    higher_is_better: false

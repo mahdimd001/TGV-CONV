@@ -1,0 +1,24 @@
+{
+  "perplexity": {
+    "all": {
+      "ppl": 6.526377387447778,
+      "tokens": 8361,
+      "truncated_references": 6
+    },
+    "turn1": {
+      "ppl": 5.481451977430706,
+      "tokens": 2139,
+      "truncated_references": 0
+    },
+    "turn2": {
+      "ppl": 4.540608673342969,
+      "tokens": 2975,
+      "truncated_references": 1
+    },
+    "turn3": {
+      "ppl": 10.208229531855675,
+      "tokens": 3247,
+      "truncated_references": 5
+    }
+  }
+}

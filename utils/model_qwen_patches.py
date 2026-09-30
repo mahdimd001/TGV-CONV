@@ -18,6 +18,8 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     repeat_kv
 )
 
+from utils.continuation_mask import continuation_causal_mask
+
 _is_torch_xpu_available = is_torch_xpu_available()
 
 try:
@@ -39,7 +41,10 @@ def eager_attention_forward_with_dynamic_mask(
     value_states = repeat_kv(value, module.num_key_value_groups)
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
+    if 1 < attn_weights.shape[-2] < attn_weights.shape[-1]:
+        # prefill on top of a carried-over cache: every layer needs its own causal mask (layers keep different lengths)
+        attn_weights = attn_weights + continuation_causal_mask(attn_weights)
+    elif attention_mask is not None:
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask[..., :key_states.shape[-2]]
 

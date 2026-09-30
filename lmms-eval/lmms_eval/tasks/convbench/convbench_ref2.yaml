@@ -1,0 +1,34 @@
+# ConvBench perfect-perception-and-reasoning ablation (S~ in the paper): turns 1-2 in the history are references.
+# Reported S3/S0 correspond to the paper's S~3, S~0; text metrics cover turn 3.
+include: _default_template_yaml
+task: "convbench_ref2"
+process_results: !function utils.convbench_ref2_process_results
+lmms_eval_specific_kwargs:
+  default:
+    n_ref_turns: 2
+    score_references: false  # PPL uses the reference history in every setting; it is reported by `convbench`
+metric_list:
+  - metric: convbench_S0
+    aggregation: !function utils.convbench_aggregate_score
+    higher_is_better: true
+  - metric: convbench_S3
+    aggregation: !function utils.convbench_aggregate_score
+    higher_is_better: true
+  - metric: convbench_BLEU1
+    aggregation: !function utils.convbench_bleu1
+    higher_is_better: true
+  - metric: convbench_BLEU2
+    aggregation: !function utils.convbench_bleu2
+    higher_is_better: true
+  - metric: convbench_BLEU3
+    aggregation: !function utils.convbench_bleu3
+    higher_is_better: true
+  - metric: convbench_BLEU4
+    aggregation: !function utils.convbench_bleu4
+    higher_is_better: true
+  - metric: convbench_METEOR
+    aggregation: !function utils.convbench_meteor
+    higher_is_better: true
+  - metric: convbench_ROUGE_L
+    aggregation: !function utils.convbench_rouge_l
+    higher_is_better: true
