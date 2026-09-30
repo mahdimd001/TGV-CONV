@@ -692,3 +692,40 @@ def test_reference_scored_on_a_fork_sees_the_answer_context_and_leaves_it_intact
     assert answer == plain_answer and conv.stream == plain.stream
     assert all(torch.equal(a[0], b[0]) for a, b in zip(conv.cache, plain.cache))
     assert all(torch.equal(a, b) for a, b in zip(conv.criteria.is_image, plain.criteria.is_image))
+
+
+def test_debug_log_shows_one_block_per_turn_and_hides_ppl_scoring(monkeypatch: pytest.MonkeyPatch) -> None:
+    import re
+
+    monkeypatch.setenv("MODEL_TYPE", "llava-7B")
+    monkeypatch.setenv("KV_CACHE_TYPE", "tgv_kv")
+    monkeypatch.setenv("PRUNE_RATIO", "0.5")
+    monkeypatch.setenv("MULTI_TURN_DECODE_EVICTION", "0")
+    monkeypatch.setenv("CONVBENCH_DEBUG_PROMPTS", "1")
+    torch, model, first = _tiny_llava(num_layers=32)
+    from lmms_eval.models.model_utils import kv_carryover as kc
+
+    import utils.generate_patches as patches
+    from kv_caches import get_kv_cache
+
+    monkeypatch.setattr(patches, "get_kv_cache", get_kv_cache)
+    logged: List[str] = []
+    monkeypatch.setattr(kc.eval_logger, "info", logged.append)
+    conv = kc.CarryOverConversation(model, _IdsAdapter(first))
+    conv.start(first)
+    conv.score_on_fork([300, 301])  # PPL scoring: not logged
+    conv.generate()
+    conv.extend([200, 201, 202, 203])
+    conv.score_on_fork([300])
+    conv.generate()
+
+    assert [block.splitlines()[0] for block in logged] == ["turn 1", "turn 2"]
+    numbers = [[float(x) for x in re.findall(r"\d+(?:\.\d+)?", block)] for block in logged]
+    # turn 1: before (image 0, text 0) (image 4 + question 15 new) | after prefill | after answer = text + 5 answer tokens
+    assert numbers[0][1:5] == [0, 0, 4, 15]
+    after_answer_1 = re.search(r"after answer: \(image ([\d.]+), text ([\d.]+)\)", logged[0]).groups()
+    before_2 = re.search(r"before prefill: \(image ([\d.]+), text ([\d.]+)\)", logged[1]).groups()
+    assert before_2 == after_answer_1  # the cache the next turn starts from is the one the answer left
+    assert "new question tokens 4 + 1 last token of the previous answer" in logged[1]
+    prefill_2 = float(re.search(r"after prefill:  \(image [\d.]+, text ([\d.]+)\)", logged[1]).group(1))
+    assert f"= text {kc._n(prefill_2)} + 5 answer tokens" in logged[1]

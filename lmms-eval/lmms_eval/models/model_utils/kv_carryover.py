@@ -12,7 +12,8 @@ Environment variables:
   MULTI_TURN_KV_CARRYOVER    1 (default) carry the cache | 0 re-encode the full history every turn (v3 behaviour)
   MULTI_TURN_DECODE_EVICTION 0 (default) compress only at each turn's prefill, answers are kept in full until the
                              next prefill | 1 also apply TGV-KV's one-entry-per-step eviction while decoding
-  CONVBENCH_DEBUG_PROMPTS    1 to log, per turn, the cached image/text entries and the tokens processed
+  CONVBENCH_DEBUG_PROMPTS    1 to log, per turn, the image/text entries in the cache before the prefill, after the
+                             prefill's compression and after the answer (PPL scoring passes are not logged)
   PPL_HISTORY                model (default) score reference k where answer k is generated, on a copy of the
                              conversation's cache | reference: after the reference history (see reference_scoring)
 """
@@ -100,7 +101,9 @@ class CarryOverConversation:
         self.pending: List[int] = []  # tokens produced but not yet processed by the model
         self.first_inputs = None
         self.turn = 0
-        self.label = ""  # shown in the debug log
+        self.name = ""  # conversation id shown in the debug log
+        self.quiet = False  # True for PPL scoring passes, which are not logged
+        self.answer_tail = 0  # tokens of the last answer still in `pending` (the model has not processed them yet)
 
     def fork(self) -> "CarryOverConversation":
         """An independent copy of the conversation (cache, TGV-KV state, tokens); the original is left untouched."""
@@ -113,7 +116,7 @@ class CarryOverConversation:
     def score_on_fork(self, target_ids: List[int]) -> Tuple[float, int]:
         """NLL of `target_ids` as the next assistant turn, scored on a copy so the conversation itself does not change."""
         twin = self.fork()
-        twin.label = " scoring the reference"
+        twin.quiet = True
         scorer = ForcedTokenScorer(target_ids)
         twin.force(target_ids, len(target_ids), scorer)
         return (-torch.stack(scorer.logprobs).sum().item(), len(scorer.logprobs)) if scorer.logprobs else (0.0, 0)
@@ -125,7 +128,7 @@ class CarryOverConversation:
         self.pending = self.pending + ids
 
     def generate(self) -> List[int]:
-        return self._run(**self.adapter.generate_kwargs)
+        return self._run("answer", **self.adapter.generate_kwargs)
 
     def force(self, answer: List[int], max_forced: int, scorer: Optional[ForcedTokenScorer] = None) -> List[int]:
         """Teacher-forces a fixed assistant turn (a reference answer); `scorer` records the log-probs.
@@ -138,12 +141,14 @@ class CarryOverConversation:
             raise ValueError("Cannot force an empty assistant turn")
         scorer = scorer or ForcedTokenScorer(target)
         config = GenerationConfig(max_new_tokens=len(target), do_sample=False, num_beams=1, pad_token_id=self.adapter.pad_id)
-        produced = self._run(generation_config=config, use_model_defaults=False, logits_processor=LogitsProcessorList([scorer]))
+        produced = self._run("reference answer", generation_config=config, use_model_defaults=False, logits_processor=LogitsProcessorList([scorer]))
         self.pending = self.pending + answer[len(produced) :]
+        self.answer_tail = len(self.pending)
         return produced
 
-    def _run(self, **gen) -> List[int]:
+    def _run(self, kind: str, **gen) -> List[int]:
         self.turn += 1
+        answer_tail = self.answer_tail  # part of this turn's new tokens that belongs to the previous answer
         if self.cache is None:
             inputs = dict(self.first_inputs)
             full = inputs["input_ids"][0].tolist()
@@ -171,12 +176,42 @@ class CarryOverConversation:
         self.cache = out.past_key_values
         self.stream = full + produced[:-1]  # the last token has not been through the model yet
         self.pending = [] if produced[-1:] and produced[-1] in self.adapter.eos_ids else produced[-1:]
+        self.answer_tail = len(self.pending)
         represented = self.criteria.logical_len if self.criteria is not None else self.cache.get_seq_length()
         if represented != len(self.stream):
             raise RuntimeError(f"KV cache covers {represented} tokens but the conversation has {len(self.stream)}")
-        if os.environ.get("CONVBENCH_DEBUG_PROMPTS"):
-            self._log(new, produced, before)
+        if os.environ.get("CONVBENCH_DEBUG_PROMPTS") and not self.quiet:
+            self._log(new, answer_tail, produced, before, kind)
         return produced
+
+    def _log(self, new, answer_tail, produced, before, kind):
+        """One block per turn: the cache before the prefill, after the prefill's compression, and after the answer.
+
+        Counts are cache entries per layer, averaged over layers (each layer keeps its own subset under TGV-KV).
+        The "text" after the prefill includes the new question; the text before the next prefill equals the text
+        after this answer.
+        """
+        before = before or (0, 0)
+        new_image = sum(t in self.adapter.image_token_ids for t in new)
+        new_text = len(new) - new_image
+        question = new_text - answer_tail
+        compressed = self.criteria.after_prefill if self.criteria is not None else None
+        if compressed is None:  # no compression: everything processed stays in the cache
+            compressed = (before[0] + new_image, before[1] + new_text)
+        after = self._cache_summary()
+        answer = len(produced) - 1  # the last token is not in the cache yet (the next prefill adds it) or is EOS
+        evicted = compressed[0] + compressed[1] + answer - after[0] - after[1]  # > 0 only with decode eviction
+        new_part = f"new question tokens {question}" if not new_image else f"new tokens: image {new_image}, question {question}"
+        if answer_tail:  # an answer cut by the token limit: its last token(s) enter the cache with this question
+            new_part += f" + {answer_tail} last token{'s' if answer_tail > 1 else ''} of the previous answer"
+        eviction = f", minus {_n(evicted)} evicted while decoding" if evicted > 0.05 else ""
+        header = f"conversation {self.name}, turn {self.turn}" if self.name != "" else f"turn {self.turn}"
+        eval_logger.info(
+            f"{header}\n"
+            f"  before prefill: (image {_n(before[0])}, text {_n(before[1])}) ({new_part})\n"
+            f"  after prefill:  (image {_n(compressed[0])}, text {_n(compressed[1])})\n"
+            f"  after {kind}: (image {_n(after[0])}, text {_n(after[1])}) = text {_n(compressed[1])} + {answer} {kind} tokens{eviction}"
+        )
 
     def _cache_summary(self):
         if self.cache is None:
@@ -189,18 +224,10 @@ class CarryOverConversation:
         image = sum(int(f.sum()) for f in flags) / len(flags)
         return image, sum(f.numel() for f in flags) / len(flags) - image
 
-    def _log(self, new, produced, before):
-        new_image = sum(t in self.adapter.image_token_ids for t in new)
-        after = self._cache_summary()
-        cached = "empty" if before is None else f"{before[0]:.0f} image + {before[1]:.0f} text"
-        compressed = self.criteria.after_prefill if self.criteria is not None else None
-        compressed = "no compression" if compressed is None else f"{compressed[0]:.0f} image + {compressed[1]:.0f} text"
-        eval_logger.info(
-            f"[turn {self.turn}{self.label}] cache before: {cached} | prefill processes {new_image} image + {len(new) - new_image} text"
-            f" | after prefill compression: {compressed} | produced {len(produced)} tokens"
-            f" | cache after the turn: {after[0]:.0f} image + {after[1]:.0f} text (entries per layer, mean)"
-            f"\nprefill text: {self.adapter.decode_prompt(new)}"
-        )
+
+def _n(x: float) -> str:
+    """A per-layer mean: whole numbers without decimals, otherwise one decimal."""
+    return f"{x:.1f}".rstrip("0").rstrip(".")
 
 
 def _fixed_answer(doc_to_text, doc, outputs, round_info) -> Optional[str]:
@@ -222,6 +249,7 @@ def run_conversation(model, adapter: ChatAdapter, doc, context: str, doc_to_text
     after image, Q1, A1, ..., Qk (the model's own answers), so it sees exactly the context answer k is generated from.
     """
     conv = CarryOverConversation(model, adapter)
+    conv.name = doc.get("id", "") if isinstance(doc, dict) else ""
     scores = ReferenceScores(references or [], adapter.tokenize_answer, max_new_tokens)
     messages = [{"role": "user", "content": context}]
     prompt = adapter.chat_text(messages)
@@ -252,6 +280,7 @@ def score_references_carryover(model, adapter: ChatAdapter, doc, doc_to_text, ma
     if not requests:
         return None
     conv = CarryOverConversation(model, adapter)
+    conv.quiet = True  # a PPL scoring pass, not the model's conversation
     nll, tokens, truncated = [], [], []
     prev_prompt = prev_reference = None
     for history, reference in requests:

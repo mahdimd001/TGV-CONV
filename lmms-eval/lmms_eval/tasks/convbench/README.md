@@ -92,7 +92,20 @@ Without compression (no `KV_CACHE_TYPE`), carrying the cache is exactly equivale
 
 Carrying the cache needs `attn_implementation=eager`, and a chat template that renders earlier turns the same way in later prompts. The llava-hf and Qwen templates do; otherwise the run stops with an error that points to `MULTI_TURN_KV_CARRYOVER=0`.
 
-`CONVBENCH_DEBUG_PROMPTS=1` logs, per turn: the cached image and text entries, the tokens processed at prefill (and their text), the cache size right after the prefill compression, and the number of generated tokens.
+`CONVBENCH_DEBUG_PROMPTS=1` logs one block per turn of the model's conversation (the PPL scoring passes are not logged):
+
+```
+conversation 1, turn 2
+  before prefill: (image 90, text 57) (new question tokens 36)
+  after prefill:  (image 41, text 75)
+  after answer: (image 41, text 194) = text 75 + 119 answer tokens
+```
+
+- Counts are KV-cache entries per layer, averaged over the layers: TGV-KV keeps a different subset in each layer, so they can have a decimal.
+- "text" after the prefill includes the new question; "text" before the next turn's prefill equals "text" after this answer.
+- The new tokens of turns 2 and 3 are only the question with its chat-template markers, never image tokens: the image was processed once in turn 1 and stays in the cache in compressed form.
+- An answer cut by the token limit has its last token processed with the next question; the log then says "+ 1 last token of the previous answer".
+- With `MULTI_TURN_DECODE_EVICTION=1` the last line also shows the entries evicted while the answer was generated.
 
 With TGV-KV, set `MAX_GENERATED_TOKENS` to 1024 or more. `utils/generate_patches.py` stops decoding at that value regardless of `max_new_tokens`, which would cut both the answers and the PPL scoring. For a full-KV baseline, unset `KV_CACHE_TYPE` but keep `MODEL_TYPE` set.
 

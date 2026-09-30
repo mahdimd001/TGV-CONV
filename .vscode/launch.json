@@ -22,7 +22,7 @@
                 "CONVBENCH_GRADING": "none",
                 "CONVBENCH_DEBUG_PROMPTS": "1",
                 "MULTI_TURN_KV_CARRYOVER": "1",
-                "MULTI_TURN_DECODE_EVICTION": "1",
+                "MULTI_TURN_DECODE_EVICTION": "0",
                 "CONVBENCH_TEXT_METRICS" : "0"
             },
             "args": [
@@ -41,7 +41,7 @@
                 "--output_path",
                 "./logs/",
                 "--limit",
-                "10"
+                "100"
 
             ]
         }
