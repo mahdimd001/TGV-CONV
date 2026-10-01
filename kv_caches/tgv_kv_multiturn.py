@@ -16,6 +16,28 @@ def _text_after_first_image(kept_flags):
     return int((~kept_flags).sum())
 
 
+def _allocate(total, shares, capacity):
+    """Splits `total` entries over layers in proportion to `shares`, never above a layer's `capacity` (its entries);
+    what a full layer cannot take is split over the other layers in proportion to their shares."""
+    shares = np.asarray(shares, dtype=np.float64)
+    capacity = np.asarray(capacity, dtype=np.float64)
+    keep = np.zeros_like(capacity)
+    active = np.ones(len(capacity), dtype=bool)
+    remaining = float(min(total, capacity.sum()))
+    while remaining > 1e-9 and active.any():
+        weights = np.where(active, shares, 0.0)
+        weights = weights / weights.sum() if weights.sum() > 0 else active / active.sum()
+        offer = remaining * weights
+        room = capacity - keep
+        full = active & (offer >= room)
+        if not full.any():
+            return keep + offer
+        remaining -= room[full].sum()
+        keep[full] = capacity[full]
+        active &= ~full
+    return keep
+
+
 class MultiTurnTGVKVCache(TGVKVCache):
     """TGV-KV whose compressed cache is carried across the turns of one conversation.
 
@@ -26,14 +48,23 @@ class MultiTurnTGVKVCache(TGVKVCache):
         a different subset after eviction;
       * image entries are ranked by text-weighted attention from the new text tokens (TWR), text entries are
         kept first (TPR), and layer budgets follow the new text tokens' attention to the image (TVB);
-      * the budget is (1 - ratio) x all tokens of the conversation so far, the rule TGV-KV's decode step uses.
+      * the budget is fixed at turn 1 (fixed_budget=True, the default): every prefill keeps on average
+        (1 - ratio) x the turn-1 prompt length per layer, however long the answers were; with False it is
+        (1 - ratio) x all tokens of the conversation so far;
+      * the total is split over layers by TVB; a layer offered more than it holds keeps everything and the rest goes
+        to the other layers in proportion to their shares, so the budget is actually reached.
     decode_eviction=False keeps every generated token until the next prefill (compression only at prefills);
-    True applies TGV-KV's usual one-entry-per-step decode eviction as well.
+    True applies TGV-KV's usual one-entry-per-step decode eviction as well, holding each layer at its budget
+    (fixed_budget=True) or at the growing (1 - ratio) x conversation rule of single-turn TGV-KV (False).
     """
 
-    def __init__(self, *args, decode_eviction=False, **kwargs):
+    def __init__(self, *args, decode_eviction=False, fixed_budget=True, **kwargs):
         super().__init__(*args, **kwargs)
         self.decode_eviction = decode_eviction
+        self.fixed_budget = fixed_budget
+        self.budget = None  # entries per layer (mean) kept at turn 1's prefill
+        self.layer_budget = None  # entries per layer after the last prefill (decode holds them with fixed_budget)
+        self.last_target = None  # mean entries per layer the last prefill compressed to (for the log)
         self.is_image = None  # per layer: bool tensor with one flag per cached entry
         self.logical_len = 0  # conversation tokens the cache represents (positions are logical)
         self.error = None
@@ -142,6 +173,8 @@ class MultiTurnTGVKVCache(TGVKVCache):
 
         seq_lens = np.array([p[0].size(self.k_seq_dim) for p in past_key_values])
         seq_len = past_key_values[0][0].size(self.k_seq_dim)
+        self.budget = self.last_target = num_of_token * (1 - self.ratio)
+        self.layer_budget = seq_lens.astype(np.float64)
         if int(seq_len - num_of_token * (1 - self.ratio)) * self.layer_num <= 0:
             print(f"{Fore.YELLOW}[WARNING] No KV to prune!{Fore.RESET}")
             return past_key_values
@@ -151,6 +184,7 @@ class MultiTurnTGVKVCache(TGVKVCache):
         normalized_layer_ratio = text_image_attn_sum / text_image_attn_sum.sum()
         layer_ratio = (seq_len - (len(normalized_layer_ratio) * seq_len * (1 - self.ratio) * normalized_layer_ratio)) / seq_len
         self.ratios = layer_ratio.float().cpu().numpy()
+        self.layer_budget = seq_lens * (1 - self.ratios)
         forget_nums = (self.ratios * seq_lens).round().astype(np.int32)
         forget_nums[forget_nums < 0] = 0
         if np.all(forget_nums <= 0):
@@ -161,7 +195,7 @@ class MultiTurnTGVKVCache(TGVKVCache):
         return self._select(past_key_values, list(stats["score_sums"]), forget_nums, self.is_image, lambda idx, _: int((idx >= text_start).sum()))
 
     def _prefill_history(self, past_key_values, num_of_token, stats):
-        """Turn 2+: compress carried cache + new tokens to (1 - ratio) x conversation length."""
+        """Turn 2+: compress carried cache + new tokens to the budget (fixed at turn 1, or the conversation rule)."""
         new_flags = stats["new_is_image"]
         flags = [torch.cat([f, new_flags.to(f.device)]) for f in self.is_image]
         seq_lens = np.array([p[0].size(self.k_seq_dim) for p in past_key_values])
@@ -172,8 +206,11 @@ class MultiTurnTGVKVCache(TGVKVCache):
         tia = torch.stack([t.float() for t in stats["text_image_attn_sums"]])
         total = tia.sum()
         share = tia / total if total > 0 else torch.full_like(tia, 1.0 / self.layer_num)  # TVB
-        keep = (self.layer_num * num_of_token * (1 - self.ratio) * share).cpu().numpy()
-        self.ratios = 1 - keep / num_of_token  # decode keeps num_of_token * (1 - ratios) per layer
+        target = self.budget if self.fixed_budget and self.budget is not None else num_of_token * (1 - self.ratio)
+        self.last_target = target
+        keep = _allocate(self.layer_num * target, share.cpu().numpy(), seq_lens)
+        self.layer_budget = keep
+        self.ratios = 1 - keep / num_of_token  # growing rule: decode keeps num_of_token * (1 - ratios) per layer
         forget_nums = np.round(seq_lens - keep).astype(np.int32)
         forget_nums[forget_nums < 0] = 0
 
@@ -192,7 +229,8 @@ class MultiTurnTGVKVCache(TGVKVCache):
         if not self.decode_eviction:
             return past_key_values
 
-        forget_nums = (seq_lens - num_of_token * (1 - self.ratios)).astype(np.int32)
+        limit = self.layer_budget if self.fixed_budget else num_of_token * (1 - self.ratios)
+        forget_nums = (seq_lens - limit).astype(np.int32)
         forget_nums[forget_nums < 0] = 0
         if np.all(forget_nums <= 0):
             return past_key_values

@@ -17,13 +17,14 @@
                 "CUDA_VISIBLE_DEVICES": "0",
                 "MODEL_TYPE": "llava-7B",
                 "MAX_GENERATED_TOKENS": "512",
-                "KV_CACHE_TYPE": "tgv_kv",
+                "KV_CACHE_TYPE": "elastic",
                 "PRUNE_RATIO": "0.8",
                 "CONVBENCH_GRADING": "none",
                 "CONVBENCH_DEBUG_PROMPTS": "1",
                 "MULTI_TURN_KV_CARRYOVER": "1",
                 "MULTI_TURN_DECODE_EVICTION": "0",
-                "CONVBENCH_TEXT_METRICS" : "0"
+                "CONVBENCH_TEXT_METRICS" : "0",
+                "CONVBENCH_PPL":"1"
             },
             "args": [
                 "--num_processes=1",
@@ -41,7 +42,7 @@
                 "--output_path",
                 "./logs/",
                 "--limit",
-                "100"
+                "10"
 
             ]
         }

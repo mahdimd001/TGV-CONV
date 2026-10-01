@@ -19,6 +19,7 @@ export PPL_HISTORY=model           # R_k scored after Q1, A1, ..., Q_k (model's 
 # Multi-turn KV cache: carried across turns and re-compressed at every turn's prefill
 export MULTI_TURN_KV_CARRYOVER=1   # 0 = re-encode the whole history every turn (previous behaviour)
 export MULTI_TURN_DECODE_EVICTION=0  # 1 = also evict one entry per decode step (TGV-KV's single-turn behaviour)
+export MULTI_TURN_BUDGET=fixed     # every turn keeps the turn-1 budget | conversation: grows with the conversation
 
 # LLM judge (only needed when CONVBENCH_GRADING is not none)
 export CONVBENCH_JUDGE_MODEL=gpt-4o-mini
@@ -36,12 +37,17 @@ run() {
 unset KV_CACHE_TYPE
 run
 
-# TGV-KV at several retention levels (PRUNE_RATIO=0.9 keeps 10% of the KV cache)
-export KV_CACHE_TYPE=tgv_kv
-for ratio in 0.5 0.8 0.9 0.95
+# TGV-KV and the baselines (Elastic Cache, H2O, Local) at several retention levels (PRUNE_RATIO=0.9 keeps 10%)
+# Elastic Cache options: ELASTIC_SELECTION=paper|official, ELASTIC_START_SIZE=1, ELASTIC_DISTANCE=-25
+# H2O options: H2O_SELECTION=paper (official is single-turn only), H2O_START_SIZE=1; Local: LOCAL_START_SIZE=1
+for method in tgv_kv elastic h2o local
 do
-  export PRUNE_RATIO=$ratio
-  echo ${KV_CACHE_TYPE} ${PRUNE_RATIO}
-  run
+  export KV_CACHE_TYPE=$method
+  for ratio in 0.5 0.8 0.9 0.95
+  do
+    export PRUNE_RATIO=$ratio
+    echo ${KV_CACHE_TYPE} ${PRUNE_RATIO}
+    run
+  done
 done
 # Error attribution (paper's hierarchical ablation): use --tasks "convbench,convbench_ref1,convbench_ref2".

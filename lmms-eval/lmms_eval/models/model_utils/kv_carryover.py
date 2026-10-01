@@ -1,8 +1,8 @@
 """Multi-turn generation that carries the KV cache from one turn to the next.
 
-Turn 1 prefills the image and the first question; with TGV-KV the cache is compressed at that prefill.
+Turn 1 prefills the image and the first question; with KV compression (TGV-KV, Elastic Cache) the cache is compressed at that prefill.
 Turn r > 1 prefills only the new tokens (the end of the previous answer, the chat-template glue and the
-next question) on top of the carried cache, and TGV-KV compresses the whole cache again. So turn 2 sees the
+next question) on top of the carried cache, and the method compresses the whole cache again. So turn 2 sees the
 compressed image + question 1 and answer 1 as the model generated it, instead of re-encoding everything.
 
 Without KV compression (KV_CACHE_TYPE unset) the cache is carried in full, which is equivalent to
@@ -11,7 +11,10 @@ re-encoding the whole conversation, only cheaper.
 Environment variables:
   MULTI_TURN_KV_CARRYOVER    1 (default) carry the cache | 0 re-encode the full history every turn (v3 behaviour)
   MULTI_TURN_DECODE_EVICTION 0 (default) compress only at each turn's prefill, answers are kept in full until the
-                             next prefill | 1 also apply TGV-KV's one-entry-per-step eviction while decoding
+                             next prefill | 1 also apply the method's decode eviction (TGV-KV: one entry per step;
+                             Elastic Cache: fixed-point elimination; H2O: lowest accumulated score; Local: oldest)
+  MULTI_TURN_BUDGET          fixed (default) every prefill compresses to the budget set at turn 1, (1 - PRUNE_RATIO) x
+                             the turn-1 prompt | conversation: (1 - PRUNE_RATIO) x all tokens of the conversation so far
   CONVBENCH_DEBUG_PROMPTS    1 to log, per turn, the image/text entries in the cache before the prefill, after the
                              prefill's compression and after the answer (PPL scoring passes are not logged)
   PPL_HISTORY                model (default) score reference k where answer k is generated, on a copy of the
@@ -41,14 +44,17 @@ def carryover_enabled() -> bool:
 
 
 def make_criteria():
-    """A TGV-KV state shared by all turns of one conversation, or None without KV compression."""
+    """A KV-compression state (KV_CACHE_TYPE: tgv_kv, elastic, h2o or local) shared by all turns of a conversation, or None."""
     method = os.environ.get("KV_CACHE_TYPE")
     if not method or method.lower() == "none":
         return None
     from kv_caches import get_kv_cache  # TGV-KV root package, importable when TGV-KV's patches are loaded
 
     decode_eviction = os.environ.get("MULTI_TURN_DECODE_EVICTION", "0").strip() == "1"
-    return get_kv_cache(method, prune_ratio=float(os.environ.get("PRUNE_RATIO", 0.9)), multi_turn=True, decode_eviction=decode_eviction)
+    budget = os.environ.get("MULTI_TURN_BUDGET", "fixed").strip().lower()
+    if budget not in ("fixed", "conversation"):
+        raise ValueError(f"MULTI_TURN_BUDGET must be 'fixed' or 'conversation', got {budget!r}")
+    return get_kv_cache(method, prune_ratio=float(os.environ.get("PRUNE_RATIO", 0.9)), multi_turn=True, decode_eviction=decode_eviction, fixed_budget=budget == "fixed")
 
 
 @dataclass
@@ -95,7 +101,7 @@ class CarryOverConversation:
         if self.criteria is not None:
             config = getattr(model.config, "text_config", model.config)
             if getattr(config, "_attn_implementation", None) != "eager":
-                raise RuntimeError("TGV-KV multi-turn carry-over needs attn_implementation=eager.")
+                raise RuntimeError("KV compression with multi-turn carry-over needs attn_implementation=eager.")
         self.cache = None
         self.stream: List[int] = []  # conversation tokens the cache represents
         self.pending: List[int] = []  # tokens produced but not yet processed by the model
@@ -106,7 +112,7 @@ class CarryOverConversation:
         self.answer_tail = 0  # tokens of the last answer still in `pending` (the model has not processed them yet)
 
     def fork(self) -> "CarryOverConversation":
-        """An independent copy of the conversation (cache, TGV-KV state, tokens); the original is left untouched."""
+        """An independent copy of the conversation (cache, compression state, tokens); the original is left untouched."""
         twin = copy.copy(self)
         twin.cache = copy.deepcopy(self.cache)
         twin.criteria = copy.deepcopy(self.criteria)
@@ -170,7 +176,7 @@ class CarryOverConversation:
         finally:
             del self.model._tgv_kv_session
         if self.criteria is not None and self.criteria.error is not None:
-            raise RuntimeError(f"TGV-KV failed during turn {self.turn}") from self.criteria.error
+            raise RuntimeError(f"KV compression ({type(self.criteria).__name__}) failed during turn {self.turn}") from self.criteria.error
 
         produced = out.sequences[0, len(full) :].tolist()
         self.cache = out.past_key_values
@@ -187,7 +193,7 @@ class CarryOverConversation:
     def _log(self, new, answer_tail, produced, before, kind):
         """One block per turn: the cache before the prefill, after the prefill's compression, and after the answer.
 
-        Counts are cache entries per layer, averaged over layers (each layer keeps its own subset under TGV-KV).
+        Counts are cache entries per layer, averaged over layers (under TGV-KV each layer keeps its own subset).
         The "text" after the prefill includes the new question; the text before the next prefill equals the text
         after this answer.
         """
@@ -206,10 +212,12 @@ class CarryOverConversation:
             new_part += f" + {answer_tail} last token{'s' if answer_tail > 1 else ''} of the previous answer"
         eviction = f", minus {_n(evicted)} evicted while decoding" if evicted > 0.05 else ""
         header = f"conversation {self.name}, turn {self.turn}" if self.name != "" else f"turn {self.turn}"
+        target = getattr(self.criteria, "last_target", None)
+        budget = f" (budget {_n(target)})" if target is not None else ""
         eval_logger.info(
             f"{header}\n"
             f"  before prefill: (image {_n(before[0])}, text {_n(before[1])}) ({new_part})\n"
-            f"  after prefill:  (image {_n(compressed[0])}, text {_n(compressed[1])})\n"
+            f"  after prefill:  (image {_n(compressed[0])}, text {_n(compressed[1])}){budget}\n"
             f"  after {kind}: (image {_n(after[0])}, text {_n(after[1])}) = text {_n(compressed[1])} + {answer} {kind} tokens{eviction}"
         )
 

@@ -1,0 +1,655 @@
+diff --git a/kv_caches/__init__.py b/kv_caches/__init__.py
+index bb9fa24..5560f7a 100644
+--- a/kv_caches/__init__.py
++++ b/kv_caches/__init__.py
+@@ -25,6 +25,7 @@ def get_kv_cache(
+     model_name="llava-v1.5-7b",
+     multi_turn=False,
+     decode_eviction=False,
++    fixed_budget=True,
+ ):
+     first_call = not hasattr(get_kv_cache, "_printed")
+     if first_call:
+@@ -66,7 +67,7 @@ def get_kv_cache(
+         # end of the compressed prompt. ELASTIC_SELECTION=official reproduces the original code's token ranking.
+         if first_call:
+             print(f"{Fore.GREEN}+++ Using Elastic Cache +++{Style.RESET_ALL}")
+-        cache_cls, extra = (MultiTurnElasticCache, {"decode_eviction": decode_eviction, "image_token_id": image_token_id}) if multi_turn else (ElasticCache, {})
++        cache_cls, extra = (MultiTurnElasticCache, {"decode_eviction": decode_eviction, "image_token_id": image_token_id, "fixed_budget": fixed_budget}) if multi_turn else (ElasticCache, {})
+         return cache_cls(
+             **extra,
+             layer_num=layer_num,
+@@ -85,7 +86,7 @@ def get_kv_cache(
+         if first_call:
+             print(f"{Fore.GREEN}+++ Using {'H2O' if is_h2o else 'Local'} Cache +++{Style.RESET_ALL}")
+         single, multi = (H2OCache, MultiTurnH2OCache) if is_h2o else (LocalCache, MultiTurnLocalCache)
+-        cache_cls, extra = (multi, {"decode_eviction": decode_eviction, "image_token_id": image_token_id}) if multi_turn else (single, {})
++        cache_cls, extra = (multi, {"decode_eviction": decode_eviction, "image_token_id": image_token_id, "fixed_budget": fixed_budget}) if multi_turn else (single, {})
+         options = {"recent_size": recent_size, "selection": os.environ.get("H2O_SELECTION", "paper").strip().lower()} if is_h2o else {}
+         return cache_cls(
+             **extra,
+@@ -101,7 +102,7 @@ def get_kv_cache(
+         if first_call:
+             print(f"{Fore.GREEN}+++ Using TGV-KV Cache +++{Style.RESET_ALL}")
+         # multi_turn: one cache object for a whole conversation, carried across turns (see tgv_kv_multiturn.py)
+-        cache_cls, extra = (MultiTurnTGVKVCache, {"decode_eviction": decode_eviction}) if multi_turn else (TGVKVCache, {})
++        cache_cls, extra = (MultiTurnTGVKVCache, {"decode_eviction": decode_eviction, "fixed_budget": fixed_budget}) if multi_turn else (TGVKVCache, {})
+         return cache_cls(
+             **extra,
+             image_token_id=image_token_id,
+diff --git a/kv_caches/carried_cache.py b/kv_caches/carried_cache.py
+index 068673b..0baddc4 100644
+--- a/kv_caches/carried_cache.py
++++ b/kv_caches/carried_cache.py
+@@ -1,5 +1,9 @@
+ """What lmms_eval/models/model_utils/kv_carryover.py needs from a KV cache method carried across the turns of a conversation.
+ 
++Budget: with fixed_budget=True (MULTI_TURN_BUDGET=fixed, the default) every prefill compresses to the budget set at
++turn 1's prefill, (1 - ratio) x the turn-1 prompt length, so a long answer does not buy the next turn more cache; with
++False it is (1 - ratio) x the whole conversation so far. Methods ask `_target(num_of_token)` for the entries to keep.
++
+ A method subclasses CarriedCache and implements
+     _step(past_key_values, num_of_token, attentions, prefill, evict) -> (cache, kept)
+ where `kept` gives, per layer, the indices of the entries kept (None: every entry kept). `prefill` is True when this
+@@ -17,8 +21,11 @@ import torch
+ 
+ 
+ class CarriedCache:
+-    def _init_carried(self, layer_num: int, image_token_id: Optional[int], decode_eviction: bool) -> None:
++    def _init_carried(self, layer_num: int, image_token_id: Optional[int], decode_eviction: bool, fixed_budget: bool = True) -> None:
+         self.layer_num = layer_num
++        self.fixed_budget = fixed_budget
++        self.budget: Optional[float] = None  # entries per layer kept at turn 1's prefill, (1 - ratio) x turn-1 prompt
++        self.last_target: Optional[float] = None  # entries per layer the last prefill compressed to (for the log)
+         self.image_token_id = image_token_id
+         self.decode_eviction = decode_eviction
+         self.is_image: Optional[List[torch.Tensor]] = None
+@@ -32,6 +39,10 @@ class CarriedCache:
+                 return None
+             new_flags = input_ids[0, self.logical_len : num_of_token] == self.image_token_id  # tokens this forward processed
+             prefill = new_flags.numel() > 1
++            if prefill and self.budget is None:
++                self.budget = num_of_token * (1 - self.ratio)
++            if prefill:
++                self.last_target = self._target(num_of_token)
+             old = self.is_image or [new_flags[:0]] * self.layer_num
+             flags = [torch.cat([f, new_flags.to(f.device)]) for f in old]
+             if any(p[0].size(-2) != f.numel() for p, f in zip(past_key_values, flags)):
+@@ -48,6 +59,13 @@ class CarriedCache:
+             raise
+ 
+ 
++    def _target(self, num_of_token: int) -> float:
++        """Entries per layer to keep: the turn-1 budget (fixed) or (1 - ratio) x the conversation so far."""
++        if self.fixed_budget and self.budget is not None:
++            return self.budget
++        return num_of_token * (1 - self.ratio)
++
++
+ def gather_entries(past_key_values, kept: List[torch.Tensor]):
+     """A DynamicCache with, in every layer, only the entries at `kept[layer]` (in that order)."""
+     from transformers.cache_utils import DynamicCache
+diff --git a/kv_caches/elastic_cache.py b/kv_caches/elastic_cache.py
+index e43590e..dac14d4 100644
+--- a/kv_caches/elastic_cache.py
++++ b/kv_caches/elastic_cache.py
+@@ -77,7 +77,7 @@ class ElasticCache:
+     def _prefill(self, past_key_values, num_of_token, scores) -> Tuple[object, Optional[List[torch.Tensor]]]:
+         """Merges every layer down to the budget; returns the cache and, per layer, the kept indices (None: all kept)."""
+         seq_len = past_key_values[0][0].size(self.k_seq_dim)
+-        forget_num = int(seq_len - num_of_token * (1 - self.ratio))
++        forget_num = int(seq_len - self._target(num_of_token))
+         if forget_num <= 0:
+             self.fixed_point = self._fixed_point(seq_len, 0)
+             return past_key_values, None
+@@ -114,6 +114,10 @@ class ElasticCache:
+         keep = torch.cat([torch.arange(start, device=device), selected, torch.tensor([end], device=device)])
+         return keep, throw, anchors
+ 
++    def _target(self, num_of_token: int) -> float:
++        """Entries per layer to keep (single-turn: the original rule, (1 - ratio) x all tokens so far)."""
++        return num_of_token * (1 - self.ratio)
++
+     def _fixed_point(self, seq_len: int, forget_num: int) -> int:
+         if self.distance > 0:
+             return self.distance
+@@ -125,7 +129,7 @@ class ElasticCache:
+     def _decode(self, past_key_values, num_of_token) -> Tuple[object, Optional[int]]:
+         """Fixed-point elimination: deletes the entry at `fixed_point` when over budget; returns the cache and that index."""
+         seq_len = past_key_values[0][0].size(self.k_seq_dim)
+-        forget_num = int(seq_len - num_of_token * (1 - self.ratio))
++        forget_num = int(seq_len - self._target(num_of_token))
+         point = self.fixed_point
+         if point is not None and point < 0:
+             point += seq_len  # Python slicing in the original code
+@@ -141,14 +145,14 @@ class ElasticCache:
+ class MultiTurnElasticCache(CarriedCache, ElasticCache):
+     """Elastic Cache whose compressed cache is carried across the turns of one conversation.
+ 
+-    Every prefill merges the carried cache plus the new tokens down to (1 - ratio) x the conversation length,
+-    scored by the attention from the newly processed tokens. With decode_eviction=False every generated token is
++    Every prefill merges the carried cache plus the new tokens down to the budget (fixed at turn 1 by default, see
++    carried_cache.py), scored by the attention from the newly processed tokens. With decode_eviction=False every generated token is
+     kept until the next prefill; True applies fixed-point elimination while decoding, as in single-turn use.
+     """
+ 
+-    def __init__(self, *args, layer_num=None, image_token_id=None, decode_eviction=False, **kwargs):
++    def __init__(self, *args, layer_num=None, image_token_id=None, decode_eviction=False, fixed_budget=True, **kwargs):
+         ElasticCache.__init__(self, *args, layer_num=layer_num, **kwargs)
+-        self._init_carried(layer_num, image_token_id, decode_eviction)
++        self._init_carried(layer_num, image_token_id, decode_eviction, fixed_budget)
+ 
+     __call__ = CarriedCache.__call__
+ 
+diff --git a/kv_caches/h2o_cache.py b/kv_caches/h2o_cache.py
+index 81cfab6..69daafd 100644
+--- a/kv_caches/h2o_cache.py
++++ b/kv_caches/h2o_cache.py
+@@ -14,7 +14,7 @@ original prefill also ignores `start_size` (it is used only while decoding).
+ 
+ MultiTurnH2OCache (selection="paper" only) carries the cache and the accumulated scores across the turns of a
+ conversation: each prefill adds the new question's attention to the carried scores and keeps the top entries down to
+-(1 - ratio) x the conversation length; decode steps keep accumulating scores and evict only with decode_eviction=True.
++the budget (fixed at turn 1 by default, see carried_cache.py); decode steps keep accumulating scores and evict only with decode_eviction=True.
+ """
+ 
+ from typing import Optional
+@@ -75,7 +75,7 @@ class H2OCache:
+         old = self.scores if self.scores is not None else received[:0]
+         self.scores = torch.cat([old.to(received.device), received.new_zeros(received.numel() - old.numel())]) + received
+         seq_len = past_key_values[0][0].size(self.k_seq_dim)
+-        forget_num = int(seq_len - num_of_token * (1 - self.ratio))
++        forget_num = int(seq_len - self._target(num_of_token))
+         if not evict or forget_num <= 0:
+             return past_key_values, None
+         start, end = self.start_size, seq_len - self.protect_size
+@@ -91,6 +91,10 @@ class H2OCache:
+         kept = [keep] * len(past_key_values)
+         return gather_entries(past_key_values, kept), kept
+ 
++    def _target(self, num_of_token: int) -> float:
++        """Entries to keep (single-turn: the original rule, (1 - ratio) x all tokens so far)."""
++        return num_of_token * (1 - self.ratio)
++
+     def _official(self, past_key_values, num_of_token, attentions, prefill):
+         """The original H2OCache.__call__, unchanged except for device handling, online statistics and DynamicCache."""
+         received = _received_attention(attentions).to(self.score_sum.device)
+@@ -117,11 +121,11 @@ class H2OCache:
+ 
+ 
+ class MultiTurnH2OCache(CarriedCache, H2OCache):
+-    def __init__(self, *args, layer_num=None, image_token_id=None, decode_eviction=False, **kwargs):
++    def __init__(self, *args, layer_num=None, image_token_id=None, decode_eviction=False, fixed_budget=True, **kwargs):
+         H2OCache.__init__(self, *args, layer_num=layer_num, **kwargs)
+         if self.selection != "paper":
+             raise ValueError("H2O_SELECTION=official reproduces the original single-turn code; multi-turn runs need H2O_SELECTION=paper.")
+-        self._init_carried(layer_num, image_token_id, decode_eviction)
++        self._init_carried(layer_num, image_token_id, decode_eviction, fixed_budget)
+ 
+     __call__ = CarriedCache.__call__
+ 
+diff --git a/kv_caches/local_cache.py b/kv_caches/local_cache.py
+index bb11b59..60a46f1 100644
+--- a/kv_caches/local_cache.py
++++ b/kv_caches/local_cache.py
+@@ -5,7 +5,7 @@ num_of_token * (1 - ratio) entries, the oldest entries after the sinks are dropp
+ and at every decode step, and it needs no attention weights.
+ 
+ MultiTurnLocalCache carries the window across the turns of a conversation: each prefill (question k on top of the
+-carried cache) drops the oldest entries down to (1 - ratio) x the conversation length; while decoding it drops only with
++carried cache) drops the oldest entries down to the budget (fixed at turn 1 by default, see carried_cache.py); while decoding it drops only with
+ decode_eviction=True (MULTI_TURN_DECODE_EVICTION=1).
+ """
+ 
+@@ -30,7 +30,7 @@ class LocalCache:
+ 
+     def _step(self, past_key_values, num_of_token, attentions, prefill: bool, evict: bool):
+         seq_len = past_key_values[0][0].size(self.k_seq_dim)
+-        forget_num = int(seq_len - num_of_token * (1 - self.ratio))
++        forget_num = int(seq_len - self._target(num_of_token))
+         if not evict or forget_num <= 0:
+             return past_key_values, None
+         device = past_key_values[0][0].device
+@@ -38,10 +38,14 @@ class LocalCache:
+         kept = [keep] * len(past_key_values)
+         return gather_entries(past_key_values, kept), kept
+ 
++    def _target(self, num_of_token: int) -> float:
++        """Entries to keep (single-turn: the original rule, (1 - ratio) x all tokens so far)."""
++        return num_of_token * (1 - self.ratio)
++
+ 
+ class MultiTurnLocalCache(CarriedCache, LocalCache):
+-    def __init__(self, *args, layer_num=None, image_token_id=None, decode_eviction=False, **kwargs):
++    def __init__(self, *args, layer_num=None, image_token_id=None, decode_eviction=False, fixed_budget=True, **kwargs):
+         LocalCache.__init__(self, *args, layer_num=layer_num, **kwargs)
+-        self._init_carried(layer_num, image_token_id, decode_eviction)
++        self._init_carried(layer_num, image_token_id, decode_eviction, fixed_budget)
+ 
+     __call__ = CarriedCache.__call__
+diff --git a/kv_caches/tgv_kv_multiturn.py b/kv_caches/tgv_kv_multiturn.py
+index 359cece..69a0df9 100644
+--- a/kv_caches/tgv_kv_multiturn.py
++++ b/kv_caches/tgv_kv_multiturn.py
+@@ -16,6 +16,28 @@ def _text_after_first_image(kept_flags):
+     return int((~kept_flags).sum())
+ 
+ 
++def _allocate(total, shares, capacity):
++    """Splits `total` entries over layers in proportion to `shares`, never above a layer's `capacity` (its entries);
++    what a full layer cannot take is split over the other layers in proportion to their shares."""
++    shares = np.asarray(shares, dtype=np.float64)
++    capacity = np.asarray(capacity, dtype=np.float64)
++    keep = np.zeros_like(capacity)
++    active = np.ones(len(capacity), dtype=bool)
++    remaining = float(min(total, capacity.sum()))
++    while remaining > 1e-9 and active.any():
++        weights = np.where(active, shares, 0.0)
++        weights = weights / weights.sum() if weights.sum() > 0 else active / active.sum()
++        offer = remaining * weights
++        room = capacity - keep
++        full = active & (offer >= room)
++        if not full.any():
++            return keep + offer
++        remaining -= room[full].sum()
++        keep[full] = capacity[full]
++        active &= ~full
++    return keep
++
++
+ class MultiTurnTGVKVCache(TGVKVCache):
+     """TGV-KV whose compressed cache is carried across the turns of one conversation.
+ 
+@@ -26,14 +48,23 @@ class MultiTurnTGVKVCache(TGVKVCache):
+         a different subset after eviction;
+       * image entries are ranked by text-weighted attention from the new text tokens (TWR), text entries are
+         kept first (TPR), and layer budgets follow the new text tokens' attention to the image (TVB);
+-      * the budget is (1 - ratio) x all tokens of the conversation so far, the rule TGV-KV's decode step uses.
++      * the budget is fixed at turn 1 (fixed_budget=True, the default): every prefill keeps on average
++        (1 - ratio) x the turn-1 prompt length per layer, however long the answers were; with False it is
++        (1 - ratio) x all tokens of the conversation so far;
++      * the total is split over layers by TVB; a layer offered more than it holds keeps everything and the rest goes
++        to the other layers in proportion to their shares, so the budget is actually reached.
+     decode_eviction=False keeps every generated token until the next prefill (compression only at prefills);
+-    True applies TGV-KV's usual one-entry-per-step decode eviction as well.
++    True applies TGV-KV's usual one-entry-per-step decode eviction as well, holding each layer at its budget
++    (fixed_budget=True) or at the growing (1 - ratio) x conversation rule of single-turn TGV-KV (False).
+     """
+ 
+-    def __init__(self, *args, decode_eviction=False, **kwargs):
++    def __init__(self, *args, decode_eviction=False, fixed_budget=True, **kwargs):
+         super().__init__(*args, **kwargs)
+         self.decode_eviction = decode_eviction
++        self.fixed_budget = fixed_budget
++        self.budget = None  # entries per layer (mean) kept at turn 1's prefill
++        self.layer_budget = None  # entries per layer after the last prefill (decode holds them with fixed_budget)
++        self.last_target = None  # mean entries per layer the last prefill compressed to (for the log)
+         self.is_image = None  # per layer: bool tensor with one flag per cached entry
+         self.logical_len = 0  # conversation tokens the cache represents (positions are logical)
+         self.error = None
+@@ -142,6 +173,8 @@ class MultiTurnTGVKVCache(TGVKVCache):
+ 
+         seq_lens = np.array([p[0].size(self.k_seq_dim) for p in past_key_values])
+         seq_len = past_key_values[0][0].size(self.k_seq_dim)
++        self.budget = self.last_target = num_of_token * (1 - self.ratio)
++        self.layer_budget = seq_lens.astype(np.float64)
+         if int(seq_len - num_of_token * (1 - self.ratio)) * self.layer_num <= 0:
+             print(f"{Fore.YELLOW}[WARNING] No KV to prune!{Fore.RESET}")
+             return past_key_values
+@@ -151,6 +184,7 @@ class MultiTurnTGVKVCache(TGVKVCache):
+         normalized_layer_ratio = text_image_attn_sum / text_image_attn_sum.sum()
+         layer_ratio = (seq_len - (len(normalized_layer_ratio) * seq_len * (1 - self.ratio) * normalized_layer_ratio)) / seq_len
+         self.ratios = layer_ratio.float().cpu().numpy()
++        self.layer_budget = seq_lens * (1 - self.ratios)
+         forget_nums = (self.ratios * seq_lens).round().astype(np.int32)
+         forget_nums[forget_nums < 0] = 0
+         if np.all(forget_nums <= 0):
+@@ -161,7 +195,7 @@ class MultiTurnTGVKVCache(TGVKVCache):
+         return self._select(past_key_values, list(stats["score_sums"]), forget_nums, self.is_image, lambda idx, _: int((idx >= text_start).sum()))
+ 
+     def _prefill_history(self, past_key_values, num_of_token, stats):
+-        """Turn 2+: compress carried cache + new tokens to (1 - ratio) x conversation length."""
++        """Turn 2+: compress carried cache + new tokens to the budget (fixed at turn 1, or the conversation rule)."""
+         new_flags = stats["new_is_image"]
+         flags = [torch.cat([f, new_flags.to(f.device)]) for f in self.is_image]
+         seq_lens = np.array([p[0].size(self.k_seq_dim) for p in past_key_values])
+@@ -172,8 +206,11 @@ class MultiTurnTGVKVCache(TGVKVCache):
+         tia = torch.stack([t.float() for t in stats["text_image_attn_sums"]])
+         total = tia.sum()
+         share = tia / total if total > 0 else torch.full_like(tia, 1.0 / self.layer_num)  # TVB
+-        keep = (self.layer_num * num_of_token * (1 - self.ratio) * share).cpu().numpy()
+-        self.ratios = 1 - keep / num_of_token  # decode keeps num_of_token * (1 - ratios) per layer
++        target = self.budget if self.fixed_budget and self.budget is not None else num_of_token * (1 - self.ratio)
++        self.last_target = target
++        keep = _allocate(self.layer_num * target, share.cpu().numpy(), seq_lens)
++        self.layer_budget = keep
++        self.ratios = 1 - keep / num_of_token  # growing rule: decode keeps num_of_token * (1 - ratios) per layer
+         forget_nums = np.round(seq_lens - keep).astype(np.int32)
+         forget_nums[forget_nums < 0] = 0
+ 
+@@ -192,7 +229,8 @@ class MultiTurnTGVKVCache(TGVKVCache):
+         if not self.decode_eviction:
+             return past_key_values
+ 
+-        forget_nums = (seq_lens - num_of_token * (1 - self.ratios)).astype(np.int32)
++        limit = self.layer_budget if self.fixed_budget else num_of_token * (1 - self.ratios)
++        forget_nums = (seq_lens - limit).astype(np.int32)
+         forget_nums[forget_nums < 0] = 0
+         if np.all(forget_nums <= 0):
+             return past_key_values
+diff --git a/lmms-eval/lmms_eval/models/model_utils/kv_carryover.py b/lmms-eval/lmms_eval/models/model_utils/kv_carryover.py
+index 9ea291d..63ecbb2 100644
+--- a/lmms-eval/lmms_eval/models/model_utils/kv_carryover.py
++++ b/lmms-eval/lmms_eval/models/model_utils/kv_carryover.py
+@@ -13,6 +13,8 @@ Environment variables:
+   MULTI_TURN_DECODE_EVICTION 0 (default) compress only at each turn's prefill, answers are kept in full until the
+                              next prefill | 1 also apply the method's decode eviction (TGV-KV: one entry per step;
+                              Elastic Cache: fixed-point elimination; H2O: lowest accumulated score; Local: oldest)
++  MULTI_TURN_BUDGET          fixed (default) every prefill compresses to the budget set at turn 1, (1 - PRUNE_RATIO) x
++                             the turn-1 prompt | conversation: (1 - PRUNE_RATIO) x all tokens of the conversation so far
+   CONVBENCH_DEBUG_PROMPTS    1 to log, per turn, the image/text entries in the cache before the prefill, after the
+                              prefill's compression and after the answer (PPL scoring passes are not logged)
+   PPL_HISTORY                model (default) score reference k where answer k is generated, on a copy of the
+@@ -49,7 +51,10 @@ def make_criteria():
+     from kv_caches import get_kv_cache  # TGV-KV root package, importable when TGV-KV's patches are loaded
+ 
+     decode_eviction = os.environ.get("MULTI_TURN_DECODE_EVICTION", "0").strip() == "1"
+-    return get_kv_cache(method, prune_ratio=float(os.environ.get("PRUNE_RATIO", 0.9)), multi_turn=True, decode_eviction=decode_eviction)
++    budget = os.environ.get("MULTI_TURN_BUDGET", "fixed").strip().lower()
++    if budget not in ("fixed", "conversation"):
++        raise ValueError(f"MULTI_TURN_BUDGET must be 'fixed' or 'conversation', got {budget!r}")
++    return get_kv_cache(method, prune_ratio=float(os.environ.get("PRUNE_RATIO", 0.9)), multi_turn=True, decode_eviction=decode_eviction, fixed_budget=budget == "fixed")
+ 
+ 
+ @dataclass
+@@ -207,10 +212,12 @@ class CarryOverConversation:
+             new_part += f" + {answer_tail} last token{'s' if answer_tail > 1 else ''} of the previous answer"
+         eviction = f", minus {_n(evicted)} evicted while decoding" if evicted > 0.05 else ""
+         header = f"conversation {self.name}, turn {self.turn}" if self.name != "" else f"turn {self.turn}"
++        target = getattr(self.criteria, "last_target", None)
++        budget = f" (budget {_n(target)})" if target is not None else ""
+         eval_logger.info(
+             f"{header}\n"
+             f"  before prefill: (image {_n(before[0])}, text {_n(before[1])}) ({new_part})\n"
+-            f"  after prefill:  (image {_n(compressed[0])}, text {_n(compressed[1])})\n"
++            f"  after prefill:  (image {_n(compressed[0])}, text {_n(compressed[1])}){budget}\n"
+             f"  after {kind}: (image {_n(after[0])}, text {_n(after[1])}) = text {_n(compressed[1])} + {answer} {kind} tokens{eviction}"
+         )
+ 
+diff --git a/lmms-eval/lmms_eval/tasks/convbench/README.md b/lmms-eval/lmms_eval/tasks/convbench/README.md
+index 307b70c..7a53210 100644
+--- a/lmms-eval/lmms_eval/tasks/convbench/README.md
++++ b/lmms-eval/lmms_eval/tasks/convbench/README.md
+@@ -77,13 +77,13 @@ How TGV-KV compresses a carried cache (`kv_caches/tgv_kv_multiturn.py`):
+ - It tracks, for every layer, which cached entries are image tokens, because each layer keeps a different subset.
+ - Image entries are ranked by text-weighted attention from the new text tokens (TWR), and text entries are kept first (TPR).
+ - Layer budgets follow the new tokens' text-to-image attention (TVB).
+-- The budget is **(1 − `PRUNE_RATIO`) × all tokens of the conversation so far**. This is the rule TGV-KV's decode step already uses, so memory stays at the same fraction of a full cache in every turn.
++- Layer budgets follow the new tokens' text-to-image attention (TVB). When a layer is offered more entries than it holds, it keeps all of them and the rest of its share goes to the other layers, so the budget is actually reached.
+ 
+ How Elastic Cache (`KV_CACHE_TYPE=elastic`, [Liu et al., ECCV 2024](https://github.com/liuzuyan/ElasticCache); `kv_caches/elastic_cache.py`) compresses a carried cache:
+ 
+ - At every prefill, each cached entry's importance is the attention it receives from the tokens processed in that prefill (turn 1: the image and Q1; later turns: the new question), averaged over heads and summed over those tokens.
+ - Each layer keeps its most important entries, plus 1 sink entry (`ELASTIC_START_SIZE`) and the newest entry. Every other entry is merged (averaged) into its nearest kept entry instead of being discarded.
+-- All layers get the same budget, (1 − `PRUNE_RATIO`) × all tokens of the conversation so far.
++- All layers get the same budget (see "Budget" below).
+ - While decoding, Elastic Cache's fixed-point elimination deletes the entry at one fixed index (the compressed length + `ELASTIC_DISTANCE`, default −25) whenever the cache is over budget. In multi-turn runs this follows `MULTI_TURN_DECODE_EVICTION` below.
+ - `ELASTIC_SELECTION=paper` (default) keeps the highest-importance entries, as the paper describes. `ELASTIC_SELECTION=official` reproduces the authors' code exactly (tested against it): it ranks entries with a single `argsort`, which keeps the highest-importance entries only when importance falls steadily with position.
+ 
+@@ -92,7 +92,14 @@ H2O (`KV_CACHE_TYPE=h2o`, `kv_caches/h2o_cache.py`) and Local cache (`KV_CACHE_T
+ - **H2O:** every entry carries an accumulated score, the attention it receives (averaged over heads and layers) summed over every token processed so far, prompt and answers. Each prefill adds the new question's attention to the carried scores and keeps the highest-scoring entries, plus 1 sink (`H2O_START_SIZE`) and the newest entry. While decoding, the scores keep accumulating and, with decode eviction, the lowest-scoring entry is evicted. All layers keep the same entries.
+   - `H2O_SELECTION=paper` (default) keeps the highest-scoring entries and keeps each score with its entry. `H2O_SELECTION=official` reproduces the original code exactly (tested against it), including its `argsort` ranking and a score buffer that is not compacted after the prefill, so its decode-time scores belong to other entries. It does not support multi-turn runs.
+ - **Local:** a sliding window. It keeps 1 sink (`LOCAL_START_SIZE`) and the most recent entries, dropping the oldest ones; it needs no attention weights. The image is the oldest part of a conversation, so it is dropped first: at `PRUNE_RATIO=0.8` it is usually gone after turn 1's prefill.
+-- Both keep (1 − `PRUNE_RATIO`) × all tokens of the conversation so far at every prefill, the same budget as the other methods.
++- Both use the same budget as the other methods (see "Budget" below).
++
++**Budget** (all methods), set by `MULTI_TURN_BUDGET`:
++
++- `fixed` (default): the budget is set once, at turn 1's prefill: (1 − `PRUNE_RATIO`) × the turn-1 prompt (image + Q1), per layer on average. Every later prefill compresses the cache back to that same size, so a long answer does not give the next turn more cache. Answers are kept in full until the next prefill, unless decode eviction is on, in which case the cache is held at the budget while they are generated.
++- `conversation`: (1 − `PRUNE_RATIO`) × all tokens of the conversation so far, so the budget grows with every question and answer (the rule of TGV-KV's single-turn decode step).
++
++`CONVBENCH_DEBUG_PROMPTS=1` prints the budget on each turn's "after prefill" line.
+ 
+ `MULTI_TURN_DECODE_EVICTION` controls eviction while an answer is being generated:
+ 
+@@ -112,8 +119,8 @@ Carrying the cache needs `attn_implementation=eager`, and a chat template that r
+ ```
+ conversation 1, turn 2
+   before prefill: (image 90, text 57) (new question tokens 36)
+-  after prefill:  (image 41, text 75)
+-  after answer: (image 41, text 194) = text 75 + 119 answer tokens
++  after prefill:  (image 41, text 80) (budget 121.2)
++  after answer: (image 41, text 199) = text 80 + 119 answer tokens
+ ```
+ 
+ - Counts are KV-cache entries per layer, averaged over the layers: each layer keeps a different subset, so they can have a decimal.
+diff --git a/lmms-eval/test/test_convbench.py b/lmms-eval/test/test_convbench.py
+index ddcf730..2b3bb61 100644
+--- a/lmms-eval/test/test_convbench.py
++++ b/lmms-eval/test/test_convbench.py
+@@ -559,6 +559,7 @@ def test_carryover_with_tgvkv_turn1_matches_original_and_flags_stay_in_sync(monk
+     monkeypatch.setenv("KV_CACHE_TYPE", "tgv_kv")
+     monkeypatch.setenv("PRUNE_RATIO", "0.5")
+     monkeypatch.setenv("MULTI_TURN_DECODE_EVICTION", "1")
++    monkeypatch.setenv("MULTI_TURN_BUDGET", "conversation")  # the original's decode budget grows with the tokens
+     torch, model, first = _tiny_llava(num_layers=32)
+     from lmms_eval.models.model_utils.kv_carryover import CarryOverConversation
+ 
+@@ -861,55 +862,6 @@ def test_elastic_through_patched_generate_compresses_prefill_and_eliminates_at_a
+     assert lengths == {int(0.5 * (n + 5))}  # every layer at the budget, so compression and elimination ran
+ 
+ 
+-def _elastic_conversation(monkeypatch: pytest.MonkeyPatch, decode_eviction: str) -> Any:
+-    monkeypatch.setenv("MODEL_TYPE", "llava-7B")
+-    monkeypatch.setenv("KV_CACHE_TYPE", "elastic")
+-    monkeypatch.setenv("PRUNE_RATIO", "0.5")
+-    monkeypatch.setenv("MULTI_TURN_DECODE_EVICTION", decode_eviction)
+-    torch, model, first = _tiny_llava(num_layers=32)
+-    from lmms_eval.models.model_utils.kv_carryover import CarryOverConversation
+-
+-    import utils.generate_patches as patches
+-    from kv_caches import get_kv_cache
+-
+-    monkeypatch.setattr(patches, "get_kv_cache", get_kv_cache)
+-    conv = CarryOverConversation(model, _IdsAdapter(first))
+-    conv.start(first)
+-    return torch, model, conv
+-
+-
+-def test_elastic_multi_turn_compresses_each_prefill_to_the_conversation_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+-    torch, model, conv = _elastic_conversation(monkeypatch, decode_eviction="0")
+-    from kv_caches.elastic_cache import MultiTurnElasticCache
+-
+-    assert isinstance(conv.criteria, MultiTurnElasticCache)
+-    seen_inputs: List[List[int]] = []
+-    hook = model.register_forward_pre_hook(lambda mod, args, kwargs: seen_inputs.append(kwargs["input_ids"][0].tolist()), with_kwargs=True)
+-    conv.generate()
+-    for ids in ([200, 201, 202, 203, 204, 205], [210, 211, 212, 213]):
+-        expected_new = conv.pending + ids
+-        conv.extend(ids)
+-        seen_inputs.clear()
+-        conv.generate()
+-        assert seen_inputs[0] == expected_new  # the prefill processes only the new tokens
+-        after_prefill = sum(conv.criteria.after_prefill)
+-        assert after_prefill == math.ceil(0.5 * (len(conv.stream) - 5))  # budget at that prefill: (1 - ratio) x conversation
+-        lengths = [p[0].shape[-2] for p in conv.cache]
+-        assert lengths == [f.numel() for f in conv.criteria.is_image]  # flags in sync with every layer
+-        assert set(lengths) == {after_prefill + 5}  # decode eviction off: all 5 answer tokens kept
+-    hook.remove()
+-
+-
+-def test_elastic_multi_turn_decode_eviction_removes_entries_at_the_fixed_point(monkeypatch: pytest.MonkeyPatch) -> None:
+-    torch, model, conv = _elastic_conversation(monkeypatch, decode_eviction="1")
+-    conv.generate()
+-    conv.extend([200, 201, 202, 203, 204, 205])
+-    conv.generate()
+-    lengths = {p[0].shape[-2] for p in conv.cache}
+-    assert lengths == {int(0.5 * len(conv.stream))}  # held at the budget while decoding
+-    assert [f.numel() for f in conv.criteria.is_image] == [p[0].shape[-2] for p in conv.cache]
+-
+-
+ # ---------------------------------------------------------------- H2O and Local cache
+ 
+ 
+@@ -1047,11 +999,25 @@ def test_h2o_and_local_through_patched_generate_hold_the_budget(monkeypatch: pyt
+     assert {layer[0].shape[-2] for layer in out.past_key_values} == {int(0.5 * (n + 5))}
+ 
+ 
+-def _carried_conversation(monkeypatch: pytest.MonkeyPatch, method: str, decode_eviction: str) -> Any:
++def test_h2o_official_is_refused_for_multi_turn(monkeypatch: pytest.MonkeyPatch) -> None:
++    pytest.importorskip("transformers")
++    monkeypatch.setenv("MODEL_TYPE", "llava-7B")
++    monkeypatch.setenv("H2O_SELECTION", "official")
++    from kv_caches import get_kv_cache
++
++    with pytest.raises(ValueError, match="multi-turn runs need H2O_SELECTION=paper"):
++        get_kv_cache("h2o", prune_ratio=0.5, multi_turn=True)
++
++
++# ---------------------------------------------------------------- multi-turn budget, all methods
++
++
++def _carried_conversation(monkeypatch: pytest.MonkeyPatch, method: str, decode_eviction: str = "0", budget: str = "fixed", answer_tokens: int = 6) -> Any:
+     monkeypatch.setenv("MODEL_TYPE", "llava-7B")
+     monkeypatch.setenv("KV_CACHE_TYPE", method)
+     monkeypatch.setenv("PRUNE_RATIO", "0.5")
+     monkeypatch.setenv("MULTI_TURN_DECODE_EVICTION", decode_eviction)
++    monkeypatch.setenv("MULTI_TURN_BUDGET", budget)
+     torch, model, first = _tiny_llava(num_layers=32)
+     from lmms_eval.models.model_utils.kv_carryover import CarryOverConversation
+ 
+@@ -1059,14 +1025,25 @@ def _carried_conversation(monkeypatch: pytest.MonkeyPatch, method: str, decode_e
+     from kv_caches import get_kv_cache
+ 
+     monkeypatch.setattr(patches, "get_kv_cache", get_kv_cache)
+-    conv = CarryOverConversation(model, _IdsAdapter(first))
++    adapter = _IdsAdapter(first)
++    adapter.generate_kwargs["max_new_tokens"] = answer_tokens
++    conv = CarryOverConversation(model, adapter)
+     conv.start(first)
+-    return model, conv
++    return model, conv, first["input_ids"].shape[1]
+ 
+ 
+-@pytest.mark.parametrize("method", ["h2o", "local"])
+-def test_h2o_and_local_multi_turn_compress_each_prefill_to_the_conversation_budget(monkeypatch: pytest.MonkeyPatch, method: str) -> None:
+-    model, conv = _carried_conversation(monkeypatch, method, decode_eviction="0")
++def _kept_after_prefill(conv: Any) -> float:
++    return sum(conv.criteria.after_prefill)
++
++
++METHODS = ["tgv_kv", "elastic", "h2o", "local"]
++
++
++@pytest.mark.parametrize("method", METHODS)
++@pytest.mark.parametrize("budget", ["fixed", "conversation"])
++def test_multi_turn_prefills_compress_to_the_budget(monkeypatch: pytest.MonkeyPatch, method: str, budget: str) -> None:
++    """fixed: every prefill keeps the turn-1 budget; conversation: (1 - ratio) x the conversation so far."""
++    model, conv, n1 = _carried_conversation(monkeypatch, method, budget=budget)
+     seen_inputs: List[List[int]] = []
+     hook = model.register_forward_pre_hook(lambda mod, args, kwargs: seen_inputs.append(kwargs["input_ids"][0].tolist()), with_kwargs=True)
+     conv.generate()
+@@ -1076,31 +1053,76 @@ def test_h2o_and_local_multi_turn_compress_each_prefill_to_the_conversation_budg
+         seen_inputs.clear()
+         conv.generate()
+         assert seen_inputs[0] == expected_new  # the prefill processes only the new tokens
+-        after_prefill = sum(conv.criteria.after_prefill)
+-        assert after_prefill == math.ceil(0.5 * (len(conv.stream) - 5))
++        target = 0.5 * n1 if budget == "fixed" else 0.5 * (len(conv.stream) - 5)
++        assert conv.criteria.last_target == pytest.approx(target)
++        if method == "tgv_kv":  # per-layer budgets (TVB), each rounded: the mean is within half an entry
++            assert abs(_kept_after_prefill(conv) - target) <= 0.5
++        else:
++            assert _kept_after_prefill(conv) == math.ceil(target)
+         lengths = [p[0].shape[-2] for p in conv.cache]
+-        assert lengths == [f.numel() for f in conv.criteria.is_image]
+-        assert set(lengths) == {after_prefill + 5}  # decode eviction off: all 5 answer tokens kept
+-        if method == "h2o":
+-            assert conv.criteria.scores.numel() == lengths[0]  # one accumulated score per cached entry
++        assert lengths == [f.numel() for f in conv.criteria.is_image]  # flags in sync with every layer
++        assert sum(lengths) / len(lengths) == pytest.approx(_kept_after_prefill(conv) + 5)  # all 5 answer tokens kept
+     hook.remove()
+ 
+ 
+-@pytest.mark.parametrize("method", ["h2o", "local"])
+-def test_h2o_and_local_multi_turn_decode_eviction_holds_the_budget(monkeypatch: pytest.MonkeyPatch, method: str) -> None:
+-    model, conv = _carried_conversation(monkeypatch, method, decode_eviction="1")
++@pytest.mark.parametrize("method", METHODS)
++def test_fixed_budget_does_not_depend_on_the_previous_answer_length(monkeypatch: pytest.MonkeyPatch, method: str) -> None:
++    kept = []
++    for answer_tokens in (3, 9):
++        model, conv, n1 = _carried_conversation(monkeypatch, method, answer_tokens=answer_tokens)
++        conv.generate()
++        conv.extend([200, 201, 202, 203, 204, 205])
++        conv.generate()
++        kept.append(_kept_after_prefill(conv))
++    assert kept[0] == pytest.approx(kept[1], abs=0.5 if method == "tgv_kv" else 0)
++
++
++@pytest.mark.parametrize("method", METHODS)
++def test_multi_turn_decode_eviction_holds_the_fixed_budget(monkeypatch: pytest.MonkeyPatch, method: str) -> None:
++    model, conv, n1 = _carried_conversation(monkeypatch, method, decode_eviction="1")
+     conv.generate()
+     conv.extend([200, 201, 202, 203, 204, 205])
+     conv.generate()
+-    assert {p[0].shape[-2] for p in conv.cache} == {int(0.5 * len(conv.stream))}
+-    assert [f.numel() for f in conv.criteria.is_image] == [p[0].shape[-2] for p in conv.cache]
++    lengths = [p[0].shape[-2] for p in conv.cache]
++    assert [f.numel() for f in conv.criteria.is_image] == lengths
++    if method == "tgv_kv":
++        assert abs(sum(lengths) / len(lengths) - 0.5 * n1) <= 1.5  # per-layer budgets, each held while decoding
++    else:
++        assert set(lengths) == {math.ceil(0.5 * n1)}
+ 
+ 
+-def test_h2o_official_is_refused_for_multi_turn(monkeypatch: pytest.MonkeyPatch) -> None:
++def test_tgv_kv_budget_a_full_layer_cannot_use_goes_to_the_other_layers() -> None:
++    np = pytest.importorskip("numpy")
+     pytest.importorskip("transformers")
++    from kv_caches.tgv_kv_multiturn import _allocate
++
++    # 4 layers share 40 entries 70/10/10/10 (28/4/4/4), but the first holds only 20: its other 8 go to the rest
++    keep = _allocate(40, [0.7, 0.1, 0.1, 0.1], [20, 50, 50, 50])
++    assert keep.tolist() == pytest.approx([20, 4 + 8 / 3, 4 + 8 / 3, 4 + 8 / 3])
++    assert keep.sum() == pytest.approx(40)
++    assert _allocate(500, [0.25] * 4, [20, 50, 50, 50]).tolist() == [20, 50, 50, 50]  # more than they all hold
++
++
++def test_tgv_kv_later_prefill_reaches_the_budget_when_a_few_layers_dominate(monkeypatch: pytest.MonkeyPatch) -> None:
++    """Regression: with text-to-image attention concentrated in a few layers, those layers were offered more entries
++    than they hold and the excess was lost (44 kept per layer instead of 171)."""
++    torch = pytest.importorskip("torch")
++    transformers = pytest.importorskip("transformers")
+     monkeypatch.setenv("MODEL_TYPE", "llava-7B")
+-    monkeypatch.setenv("H2O_SELECTION", "official")
+     from kv_caches import get_kv_cache
+ 
+-    with pytest.raises(ValueError, match="multi-turn runs need H2O_SELECTION=paper"):
+-        get_kv_cache("h2o", prune_ratio=0.5, multi_turn=True)
++    cache = get_kv_cache("tgv_kv", prune_ratio=0.8, multi_turn=True)
++    layers, cached, new = cache.layer_num, 236, 25
++    cache.budget = 171.2  # as if turn 1 kept 171.2 per layer
++    cache.is_image = [torch.cat([torch.ones(36, dtype=torch.bool), torch.zeros(cached - 36, dtype=torch.bool)]) for _ in range(layers)]
++    pkv = transformers.cache_utils.DynamicCache([[torch.randn(1, 2, cached + new, 4), torch.randn(1, 2, cached + new, 4)] for _ in range(layers)])
++    stats = {
++        "new_is_image": torch.zeros(new, dtype=torch.bool),
++        "score_sums": [torch.rand(1, cached + new) for _ in range(layers)],
++        "text_image_attn_sums": list(torch.tensor([10.0] * 4 + [0.1] * (layers - 4))),
++    }
++    cache.initial_text_len_list = []
++    out = cache._prefill_history(pkv, 856, stats)
++    kept = [p[0].shape[-2] for p in out]
++    assert kept[:4] == [cached + new] * 4  # the dominant layers keep everything they hold
++    assert abs(sum(kept) / layers - 171.2) <= 0.5  # and the rest of the budget goes to the other layers
+diff --git a/scripts/accuracy_convbench.sh b/scripts/accuracy_convbench.sh
+index da73bc7..c51044c 100755
+--- a/scripts/accuracy_convbench.sh
++++ b/scripts/accuracy_convbench.sh
+@@ -19,6 +19,7 @@ export PPL_HISTORY=model           # R_k scored after Q1, A1, ..., Q_k (model's
+ # Multi-turn KV cache: carried across turns and re-compressed at every turn's prefill
+ export MULTI_TURN_KV_CARRYOVER=1   # 0 = re-encode the whole history every turn (previous behaviour)
+ export MULTI_TURN_DECODE_EVICTION=0  # 1 = also evict one entry per decode step (TGV-KV's single-turn behaviour)
++export MULTI_TURN_BUDGET=fixed     # every turn keeps the turn-1 budget | conversation: grows with the conversation
+ 
+ # LLM judge (only needed when CONVBENCH_GRADING is not none)
+ export CONVBENCH_JUDGE_MODEL=gpt-4o-mini

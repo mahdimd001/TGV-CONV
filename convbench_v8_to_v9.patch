@@ -1,0 +1,698 @@
+diff --git a/kv_caches/__init__.py b/kv_caches/__init__.py
+index f6c6007..bb9fa24 100644
+--- a/kv_caches/__init__.py
++++ b/kv_caches/__init__.py
+@@ -3,11 +3,15 @@ import os
+ from colorama import Fore, Style
+ 
+ from .elastic_cache import ElasticCache, MultiTurnElasticCache
++from .h2o_cache import H2OCache, MultiTurnH2OCache
++from .local_cache import LocalCache, MultiTurnLocalCache
+ from .tgv_kv import TGVKVCache
+ from .tgv_kv_multiturn import MultiTurnTGVKVCache
+ 
+ TGV_KV_NAMES = ("tgv_kv", "tgv-kv", "tgvkv")
+ ELASTIC_NAMES = ("elastic", "elastic_cache", "elastic-cache", "elasticcache")
++H2O_NAMES = ("h2o", "h2o_cache")
++LOCAL_NAMES = ("local", "local_cache", "streamingllm", "streaming_llm")
+ 
+ 
+ def get_kv_cache(
+@@ -32,8 +36,8 @@ def get_kv_cache(
+         return None
+     method = method.lower()
+ 
+-    if method not in TGV_KV_NAMES + ELASTIC_NAMES:
+-        raise ValueError(f"Unsupported KV cache method: {method}. Available: tgv_kv, elastic.")
++    if method not in TGV_KV_NAMES + ELASTIC_NAMES + H2O_NAMES + LOCAL_NAMES:
++        raise ValueError(f"Unsupported KV cache method: {method}. Available: tgv_kv, elastic, h2o, local.")
+ 
+     model_type = os.environ.get("MODEL_TYPE", None)
+     if model_type == "llava-7B":
+@@ -74,6 +78,25 @@ def get_kv_cache(
+             selection=os.environ.get("ELASTIC_SELECTION", "paper").strip().lower(),
+         )
+ 
++    # H2O and Local cache as implemented in the Elastic Cache repository (1 sink token, as in its scripts).
++    # H2O_SELECTION=official reproduces the original H2O code exactly (single-turn only).
++    if method in H2O_NAMES + LOCAL_NAMES:
++        is_h2o = method in H2O_NAMES
++        if first_call:
++            print(f"{Fore.GREEN}+++ Using {'H2O' if is_h2o else 'Local'} Cache +++{Style.RESET_ALL}")
++        single, multi = (H2OCache, MultiTurnH2OCache) if is_h2o else (LocalCache, MultiTurnLocalCache)
++        cache_cls, extra = (multi, {"decode_eviction": decode_eviction, "image_token_id": image_token_id}) if multi_turn else (single, {})
++        options = {"recent_size": recent_size, "selection": os.environ.get("H2O_SELECTION", "paper").strip().lower()} if is_h2o else {}
++        return cache_cls(
++            **extra,
++            **options,
++            layer_num=layer_num,
++            start_size=int(os.environ.get("H2O_START_SIZE" if is_h2o else "LOCAL_START_SIZE", 1)),
++            k_seq_dim=k_seq_dim,
++            v_seq_dim=v_seq_dim,
++            ratio=prune_ratio,
++        )
++
+     if method in TGV_KV_NAMES:
+         if first_call:
+             print(f"{Fore.GREEN}+++ Using TGV-KV Cache +++{Style.RESET_ALL}")
+diff --git a/kv_caches/carried_cache.py b/kv_caches/carried_cache.py
+new file mode 100644
+index 0000000..068673b
+--- /dev/null
++++ b/kv_caches/carried_cache.py
+@@ -0,0 +1,65 @@
++"""What lmms_eval/models/model_utils/kv_carryover.py needs from a KV cache method carried across the turns of a conversation.
++
++A method subclasses CarriedCache and implements
++    _step(past_key_values, num_of_token, attentions, prefill, evict) -> (cache, kept)
++where `kept` gives, per layer, the indices of the entries kept (None: every entry kept). `prefill` is True when this
++call follows a forward pass over several new tokens (turn 1: the prompt; later turns: the new question on top of the
++carried cache); `evict` is False for decode steps when MULTI_TURN_DECODE_EVICTION=0 (statistics may still be updated).
++
++The mixin tracks the conversation length the cache stands for (`logical_len`), one image/text flag per cached entry
++and layer (`is_image`, for the debug log), the entries right after the last prefill (`after_prefill`) and the error a
++call raised (`error`, because generate() swallows them).
++"""
++
++from typing import List, Optional, Tuple
++
++import torch
++
++
++class CarriedCache:
++    def _init_carried(self, layer_num: int, image_token_id: Optional[int], decode_eviction: bool) -> None:
++        self.layer_num = layer_num
++        self.image_token_id = image_token_id
++        self.decode_eviction = decode_eviction
++        self.is_image: Optional[List[torch.Tensor]] = None
++        self.logical_len = 0
++        self.after_prefill: Optional[Tuple[float, float]] = None
++        self.error: Optional[Exception] = None
++
++    def __call__(self, past_key_values, num_of_token=None, attentions=None, input_ids=None):
++        try:
++            if past_key_values is None:
++                return None
++            new_flags = input_ids[0, self.logical_len : num_of_token] == self.image_token_id  # tokens this forward processed
++            prefill = new_flags.numel() > 1
++            old = self.is_image or [new_flags[:0]] * self.layer_num
++            flags = [torch.cat([f, new_flags.to(f.device)]) for f in old]
++            if any(p[0].size(-2) != f.numel() for p, f in zip(past_key_values, flags)):
++                raise RuntimeError(f"{type(self).__name__}: cache and image flags are out of sync")
++            out, kept = self._step(past_key_values, num_of_token, attentions, prefill=prefill, evict=prefill or self.decode_eviction)
++            self.is_image = flags if kept is None else [f[idx.to(f.device)] for f, idx in zip(flags, kept)]
++            if prefill:
++                image = sum(int(f.sum()) for f in self.is_image) / self.layer_num
++                self.after_prefill = (image, sum(f.numel() for f in self.is_image) / self.layer_num - image)
++            self.logical_len = num_of_token
++            return out
++        except Exception as e:  # generate() swallows criteria errors; keep it so the caller can raise
++            self.error = e
++            raise
++
++
++def gather_entries(past_key_values, kept: List[torch.Tensor]):
++    """A DynamicCache with, in every layer, only the entries at `kept[layer]` (in that order)."""
++    from transformers.cache_utils import DynamicCache
++
++    out = []
++    for (k, v), idx in zip(past_key_values, kept):
++        index = idx.to(k.device).view(1, 1, -1, 1)
++        out.append([k.gather(-2, index.expand(k.shape[0], k.shape[1], -1, k.shape[-1])), v.gather(-2, index.expand(v.shape[0], v.shape[1], -1, v.shape[-1]))])
++    return DynamicCache(out)
++
++
++def without_index(seq_len: int, index: int, device=None) -> torch.Tensor:
++    """All entry indices except `index`."""
++    keep = torch.arange(seq_len, device=device)
++    return keep[keep != index]
+diff --git a/kv_caches/elastic_cache.py b/kv_caches/elastic_cache.py
+index 66886a3..e43590e 100644
+--- a/kv_caches/elastic_cache.py
++++ b/kv_caches/elastic_cache.py
+@@ -24,6 +24,8 @@ from typing import List, Optional, Sequence, Tuple
+ import torch
+ from transformers.cache_utils import DynamicCache
+ 
++from .carried_cache import CarriedCache, without_index
++
+ 
+ class ElasticCache:
+     supports_online_prefill = True  # per-layer importance is computed during the forward pass (eager attention)
+@@ -136,7 +138,7 @@ class ElasticCache:
+         return DynamicCache(cache), point
+ 
+ 
+-class MultiTurnElasticCache(ElasticCache):
++class MultiTurnElasticCache(CarriedCache, ElasticCache):
+     """Elastic Cache whose compressed cache is carried across the turns of one conversation.
+ 
+     Every prefill merges the carried cache plus the new tokens down to (1 - ratio) x the conversation length,
+@@ -144,59 +146,25 @@ class MultiTurnElasticCache(ElasticCache):
+     kept until the next prefill; True applies fixed-point elimination while decoding, as in single-turn use.
+     """
+ 
+-    def __init__(self, *args, image_token_id=None, decode_eviction=False, **kwargs):
+-        super().__init__(*args, **kwargs)
+-        self.image_token_id = image_token_id
+-        self.decode_eviction = decode_eviction
+-        self.is_image: Optional[List[torch.Tensor]] = None  # per layer: one flag per cached entry (for the debug log)
+-        self.logical_len = 0  # conversation tokens the cache represents
+-        self.after_prefill: Optional[Tuple[float, float]] = None  # mean (image, text) entries after the last prefill
+-        self.error: Optional[Exception] = None
+-        self._new_ids = None
++    def __init__(self, *args, layer_num=None, image_token_id=None, decode_eviction=False, **kwargs):
++        ElasticCache.__init__(self, *args, layer_num=layer_num, **kwargs)
++        self._init_carried(layer_num, image_token_id, decode_eviction)
+ 
+-    def begin_online_prefill(self, input_ids) -> bool:
+-        self._new_ids = input_ids[0, self.logical_len :]  # the tokens this prefill processes
+-        return super().begin_online_prefill(input_ids)
++    __call__ = CarriedCache.__call__
+ 
+-    def __call__(self, past_key_values, num_of_token=None, attentions=None, input_ids=None):
+-        try:
+-            if past_key_values is None:
+-                return None
+-            _require_attention(attentions)
++    def _step(self, past_key_values, num_of_token, attentions, prefill: bool, evict: bool):
++        if prefill:
+             scores = _prefill_scores(attentions)
+             if scores is None:
+-                out = self._decode_tracked(past_key_values, num_of_token)
+-            elif self._new_ids is not None:  # online statistics: the model patch knows which tokens are new
+-                out = self._prefill_tracked(past_key_values, num_of_token, scores)
+-            else:
+-                raise RuntimeError("Multi-turn Elastic Cache needs the online prefill statistics of TGV-KV's eager attention patches.")
+-            self.logical_len = num_of_token
+-            return out
+-        except Exception as e:  # generate() swallows criteria errors; keep it so the caller can raise
+-            self.error = e
+-            raise
+-
+-    def _prefill_tracked(self, past_key_values, num_of_token, scores):
+-        new_flags = self._new_ids == self.image_token_id
+-        self._new_ids = None
+-        old = self.is_image or [new_flags[:0]] * self.layer_num
+-        flags = [torch.cat([f, new_flags.to(f.device)]) for f in old]
+-        if any(p[0].size(self.k_seq_dim) != f.numel() for p, f in zip(past_key_values, flags)):
+-            raise RuntimeError("Elastic Cache: cache and image flags are out of sync")
+-        out, kept = self._prefill(past_key_values, num_of_token, scores)
+-        self.is_image = flags if kept is None else [f[idx.to(f.device)] for f, idx in zip(flags, kept)]
+-        image = sum(int(f.sum()) for f in self.is_image) / self.layer_num
+-        self.after_prefill = (image, sum(f.numel() for f in self.is_image) / self.layer_num - image)
+-        return out
+-
+-    def _decode_tracked(self, past_key_values, num_of_token):
+-        self.is_image = [torch.cat([f, f.new_zeros(1)]) for f in self.is_image]  # the generated token just processed
+-        if not self.decode_eviction:
+-            return past_key_values
++                raise RuntimeError("Elastic Cache needs the attention weights: load the model with attn_implementation=eager.")
++            return self._prefill(past_key_values, num_of_token, scores)
++        if not evict:
++            return past_key_values, None
+         out, point = self._decode(past_key_values, num_of_token)
+-        if point is not None:
+-            self.is_image = [torch.cat([f[:point], f[point + 1 :]]) for f in self.is_image]
+-        return out
++        if point is None:
++            return out, None
++        seq_len = past_key_values[0][0].size(self.k_seq_dim)
++        return out, [without_index(seq_len, point)] * self.layer_num
+ 
+ 
+ def _require_attention(attentions) -> None:
+diff --git a/kv_caches/h2o_cache.py b/kv_caches/h2o_cache.py
+new file mode 100644
+index 0000000..81cfab6
+--- /dev/null
++++ b/kv_caches/h2o_cache.py
+@@ -0,0 +1,137 @@
++"""H2O (heavy-hitter oracle), as implemented in github.com/liuzuyan/ElasticCache (kv_cache.py, H2OCache).
++
++Every cached entry carries an accumulated attention score: the attention it receives, averaged over heads and over
++layers, summed over every query processed so far (prompt tokens and generated tokens). At the prefill the entries with
++the highest scores are kept up to num_of_token * (1 - ratio), plus `start_size` sinks and the newest entry; while
++decoding, whenever the cache is over budget the entry with the lowest accumulated score is evicted. Scores are averaged
++over layers, so every layer keeps the same entries.
++
++selection="paper" (default) keeps the highest-scoring entries and keeps each score aligned with its entry.
++selection="official" reproduces the original code exactly, including two bugs: it ranks with a single argsort
++(`argsort(score) > forget_num`), which does not keep the highest-scoring entries, and it does not compact its score
++buffer after the prefill, so during decoding the scores belong to different entries than the ones in the cache. The
++original prefill also ignores `start_size` (it is used only while decoding).
++
++MultiTurnH2OCache (selection="paper" only) carries the cache and the accumulated scores across the turns of a
++conversation: each prefill adds the new question's attention to the carried scores and keeps the top entries down to
++(1 - ratio) x the conversation length; decode steps keep accumulating scores and evict only with decode_eviction=True.
++"""
++
++from typing import Optional
++
++import torch
++
++from .carried_cache import CarriedCache, gather_entries, without_index
++
++
++class H2OCache:
++    supports_online_prefill = True  # the prompt's scores are collected during the forward pass (eager attention)
++
++    def __init__(self, layer_num, start_size=1, recent_size=2047, k_seq_dim=2, v_seq_dim=2, ratio=0.0, selection="paper", **kwargs):
++        if selection not in ("paper", "official"):
++            raise ValueError(f"H2O selection must be 'paper' or 'official', got {selection!r}")
++        self.layer_num = layer_num
++        self.start_size = start_size
++        self.k_seq_dim = k_seq_dim
++        self.v_seq_dim = v_seq_dim
++        self.ratio = ratio
++        self.selection = selection
++        self.protect_size = 1
++        self.scores: Optional[torch.Tensor] = None  # paper: one accumulated score per cached entry
++        self.score_sum = torch.zeros(start_size + recent_size + 1)  # official: the original fixed-size buffer
++        self.flag = True  # official: the original's "prefill not done yet"
++        self._layer_scores = None
++
++    # ---------------------------------------------------------------- online prefill statistics
++
++    def begin_online_prefill(self, input_ids) -> bool:
++        self._layer_scores = [None] * self.layer_num
++        return True
++
++    def collect_online_prefill_attention(self, layer_idx, attention) -> None:
++        if self._layer_scores is not None and attention is not None:
++            self._layer_scores[layer_idx] = attention[0].float().mean(0).sum(0)  # received attention: [keys]
++
++    def finish_online_prefill(self):
++        scores, self._layer_scores = self._layer_scores, None
++        missing = [i for i, s in enumerate(scores or []) if s is None]
++        if scores is None or missing:
++            raise RuntimeError(f"Missing H2O prefill statistics for layers: {missing}")
++        return {"h2o_online_prefill": True, "scores": torch.stack([s.to(scores[0].device) for s in scores]).mean(0)}
++
++    # ---------------------------------------------------------------- compression
++
++    def __call__(self, past_key_values, num_of_token=None, attentions=None, input_ids=None):
++        if past_key_values is None:
++            return None
++        prefill = isinstance(attentions, dict) or (attentions is not None and attentions[0] is not None and attentions[0].shape[-2] > 1)
++        if self.selection == "official":
++            return self._official(past_key_values, num_of_token, attentions, prefill)
++        cache, _ = self._step(past_key_values, num_of_token, attentions, prefill=prefill, evict=True)
++        return cache
++
++    def _step(self, past_key_values, num_of_token, attentions, prefill: bool, evict: bool):
++        received = _received_attention(attentions)  # layer-mean attention each key received in this forward pass
++        old = self.scores if self.scores is not None else received[:0]
++        self.scores = torch.cat([old.to(received.device), received.new_zeros(received.numel() - old.numel())]) + received
++        seq_len = past_key_values[0][0].size(self.k_seq_dim)
++        forget_num = int(seq_len - num_of_token * (1 - self.ratio))
++        if not evict or forget_num <= 0:
++            return past_key_values, None
++        start, end = self.start_size, seq_len - self.protect_size
++        if prefill:  # keep the highest accumulated scores
++            n_keep = max(end - start - forget_num, 0)
++            order = torch.argsort(self.scores[start:end], descending=True, stable=True)
++            keep = torch.cat([torch.arange(start, device=order.device), order[:n_keep].sort().values + start, torch.tensor([end], device=order.device)])
++        else:  # evict the lowest accumulated score
++            if start >= end:
++                return past_key_values, None
++            keep = without_index(seq_len, int(self.scores[start:end].argmin()) + start, self.scores.device)
++        self.scores = self.scores[keep]
++        kept = [keep] * len(past_key_values)
++        return gather_entries(past_key_values, kept), kept
++
++    def _official(self, past_key_values, num_of_token, attentions, prefill):
++        """The original H2OCache.__call__, unchanged except for device handling, online statistics and DynamicCache."""
++        received = _received_attention(attentions).to(self.score_sum.device)
++        seq_len = past_key_values[0][0].size(self.k_seq_dim)
++        if prefill:
++            assert self.flag is True  # only use for the first time
++            self.score_sum[: received.numel()] += received
++        else:
++            self.score_sum[:seq_len] += received
++        forget_num = int(seq_len - num_of_token * (1 - self.ratio))
++        if forget_num <= 0:
++            return past_key_values
++        device = past_key_values[0][0].device
++        if forget_num > 1:
++            assert self.flag is True
++            self.flag = False
++            selected = torch.where(torch.argsort(self.score_sum[: (seq_len - self.protect_size)]) > forget_num)[0]
++            keep = torch.cat([selected, torch.arange(seq_len - self.protect_size, seq_len)])
++        else:
++            index = int(self.score_sum[self.start_size : (seq_len - self.protect_size)].argmin()) + self.start_size
++            self.score_sum[index:-1] = self.score_sum[index + 1 :].clone()
++            keep = without_index(seq_len, index)
++        return gather_entries(past_key_values, [keep.to(device)] * len(past_key_values))
++
++
++class MultiTurnH2OCache(CarriedCache, H2OCache):
++    def __init__(self, *args, layer_num=None, image_token_id=None, decode_eviction=False, **kwargs):
++        H2OCache.__init__(self, *args, layer_num=layer_num, **kwargs)
++        if self.selection != "paper":
++            raise ValueError("H2O_SELECTION=official reproduces the original single-turn code; multi-turn runs need H2O_SELECTION=paper.")
++        self._init_carried(layer_num, image_token_id, decode_eviction)
++
++    __call__ = CarriedCache.__call__
++
++
++def _received_attention(attentions) -> torch.Tensor:
++    """Attention each key received in this forward pass, averaged over heads and layers and summed over queries."""
++    if isinstance(attentions, dict):
++        if not attentions.get("h2o_online_prefill"):
++            raise RuntimeError("H2O got another method's prefill statistics")
++        return attentions["scores"]
++    if attentions is None or len(attentions) == 0 or attentions[0] is None:
++        raise RuntimeError("H2O needs the attention weights: load the model with attn_implementation=eager.")
++    return torch.stack([a[0].float().mean(0).sum(0).to(attentions[0].device) for a in attentions]).mean(0)
+diff --git a/kv_caches/local_cache.py b/kv_caches/local_cache.py
+new file mode 100644
+index 0000000..bb11b59
+--- /dev/null
++++ b/kv_caches/local_cache.py
+@@ -0,0 +1,47 @@
++"""Local cache (StreamingLLM-style sliding window), as in github.com/liuzuyan/ElasticCache (kv_cache.py, LocalCache).
++
++Keeps the first `start_size` entries (attention sinks) and the most recent entries; whenever the cache holds more than
++num_of_token * (1 - ratio) entries, the oldest entries after the sinks are dropped. The same rule runs at the prefill
++and at every decode step, and it needs no attention weights.
++
++MultiTurnLocalCache carries the window across the turns of a conversation: each prefill (question k on top of the
++carried cache) drops the oldest entries down to (1 - ratio) x the conversation length; while decoding it drops only with
++decode_eviction=True (MULTI_TURN_DECODE_EVICTION=1).
++"""
++
++import torch
++
++from .carried_cache import CarriedCache, gather_entries
++
++
++class LocalCache:
++    def __init__(self, layer_num=None, start_size=1, k_seq_dim=2, v_seq_dim=2, ratio=0.0, **kwargs):
++        self.layer_num = layer_num
++        self.start_size = start_size
++        self.k_seq_dim = k_seq_dim
++        self.v_seq_dim = v_seq_dim
++        self.ratio = ratio
++
++    def __call__(self, past_key_values, num_of_token=None, attentions=None, input_ids=None):
++        if past_key_values is None:
++            return None
++        cache, _ = self._step(past_key_values, num_of_token, attentions, prefill=False, evict=True)
++        return cache
++
++    def _step(self, past_key_values, num_of_token, attentions, prefill: bool, evict: bool):
++        seq_len = past_key_values[0][0].size(self.k_seq_dim)
++        forget_num = int(seq_len - num_of_token * (1 - self.ratio))
++        if not evict or forget_num <= 0:
++            return past_key_values, None
++        device = past_key_values[0][0].device
++        keep = torch.cat([torch.arange(min(self.start_size, seq_len), device=device), torch.arange(forget_num + self.start_size, seq_len, device=device)])
++        kept = [keep] * len(past_key_values)
++        return gather_entries(past_key_values, kept), kept
++
++
++class MultiTurnLocalCache(CarriedCache, LocalCache):
++    def __init__(self, *args, layer_num=None, image_token_id=None, decode_eviction=False, **kwargs):
++        LocalCache.__init__(self, *args, layer_num=layer_num, **kwargs)
++        self._init_carried(layer_num, image_token_id, decode_eviction)
++
++    __call__ = CarriedCache.__call__
+diff --git a/lmms-eval/lmms_eval/models/model_utils/kv_carryover.py b/lmms-eval/lmms_eval/models/model_utils/kv_carryover.py
+index 61c8c26..9ea291d 100644
+--- a/lmms-eval/lmms_eval/models/model_utils/kv_carryover.py
++++ b/lmms-eval/lmms_eval/models/model_utils/kv_carryover.py
+@@ -12,7 +12,7 @@ Environment variables:
+   MULTI_TURN_KV_CARRYOVER    1 (default) carry the cache | 0 re-encode the full history every turn (v3 behaviour)
+   MULTI_TURN_DECODE_EVICTION 0 (default) compress only at each turn's prefill, answers are kept in full until the
+                              next prefill | 1 also apply the method's decode eviction (TGV-KV: one entry per step;
+-                             Elastic Cache: fixed-point elimination)
++                             Elastic Cache: fixed-point elimination; H2O: lowest accumulated score; Local: oldest)
+   CONVBENCH_DEBUG_PROMPTS    1 to log, per turn, the image/text entries in the cache before the prefill, after the
+                              prefill's compression and after the answer (PPL scoring passes are not logged)
+   PPL_HISTORY                model (default) score reference k where answer k is generated, on a copy of the
+@@ -42,7 +42,7 @@ def carryover_enabled() -> bool:
+ 
+ 
+ def make_criteria():
+-    """A KV-compression state (KV_CACHE_TYPE: tgv_kv or elastic) shared by all turns of one conversation, or None."""
++    """A KV-compression state (KV_CACHE_TYPE: tgv_kv, elastic, h2o or local) shared by all turns of a conversation, or None."""
+     method = os.environ.get("KV_CACHE_TYPE")
+     if not method or method.lower() == "none":
+         return None
+diff --git a/lmms-eval/lmms_eval/tasks/convbench/README.md b/lmms-eval/lmms_eval/tasks/convbench/README.md
+index 1d2dd24..307b70c 100644
+--- a/lmms-eval/lmms_eval/tasks/convbench/README.md
++++ b/lmms-eval/lmms_eval/tasks/convbench/README.md
+@@ -87,10 +87,17 @@ How Elastic Cache (`KV_CACHE_TYPE=elastic`, [Liu et al., ECCV 2024](https://gith
+ - While decoding, Elastic Cache's fixed-point elimination deletes the entry at one fixed index (the compressed length + `ELASTIC_DISTANCE`, default −25) whenever the cache is over budget. In multi-turn runs this follows `MULTI_TURN_DECODE_EVICTION` below.
+ - `ELASTIC_SELECTION=paper` (default) keeps the highest-importance entries, as the paper describes. `ELASTIC_SELECTION=official` reproduces the authors' code exactly (tested against it): it ranks entries with a single `argsort`, which keeps the highest-importance entries only when importance falls steadily with position.
+ 
++H2O (`KV_CACHE_TYPE=h2o`, `kv_caches/h2o_cache.py`) and Local cache (`KV_CACHE_TYPE=local`, `kv_caches/local_cache.py`) are the two baselines of the Elastic Cache repository, carried across turns the same way:
++
++- **H2O:** every entry carries an accumulated score, the attention it receives (averaged over heads and layers) summed over every token processed so far, prompt and answers. Each prefill adds the new question's attention to the carried scores and keeps the highest-scoring entries, plus 1 sink (`H2O_START_SIZE`) and the newest entry. While decoding, the scores keep accumulating and, with decode eviction, the lowest-scoring entry is evicted. All layers keep the same entries.
++  - `H2O_SELECTION=paper` (default) keeps the highest-scoring entries and keeps each score with its entry. `H2O_SELECTION=official` reproduces the original code exactly (tested against it), including its `argsort` ranking and a score buffer that is not compacted after the prefill, so its decode-time scores belong to other entries. It does not support multi-turn runs.
++- **Local:** a sliding window. It keeps 1 sink (`LOCAL_START_SIZE`) and the most recent entries, dropping the oldest ones; it needs no attention weights. The image is the oldest part of a conversation, so it is dropped first: at `PRUNE_RATIO=0.8` it is usually gone after turn 1's prefill.
++- Both keep (1 − `PRUNE_RATIO`) × all tokens of the conversation so far at every prefill, the same budget as the other methods.
++
+ `MULTI_TURN_DECODE_EVICTION` controls eviction while an answer is being generated:
+ 
+ - `0` (default): no eviction during generation. Answers are kept in full until the next turn's prefill compresses them along with everything else.
+-- `1`: the method's usual decode eviction, as in its single-turn code, so answers are compressed while they are generated: TGV-KV evicts the lowest-attention entry at each step, Elastic Cache the entry at its fixed point.
++- `1`: the method's usual decode eviction, as in its single-turn code, so answers are compressed while they are generated: TGV-KV evicts the lowest-attention entry at each step, Elastic Cache the entry at its fixed point, H2O the lowest accumulated score, Local the oldest entry after the sink.
+ 
+ The ablation tasks (`convbench_ref1` and `convbench_ref2`) teacher-force the reference answers as the earlier turns, so the cache holds exactly what the history says. For PPL, each reference is forced on a copy of the conversation's cache, right before the model's answer to that turn (`PPL_HISTORY=model`), or after the compressed reference history (`PPL_HISTORY=reference`).
+ 
+diff --git a/lmms-eval/test/test_convbench.py b/lmms-eval/test/test_convbench.py
+index 0ec3bc6..ddcf730 100644
+--- a/lmms-eval/test/test_convbench.py
++++ b/lmms-eval/test/test_convbench.py
+@@ -798,9 +798,9 @@ class _OriginalElasticCache:
+         return [[torch.cat([k[:, :, :s], k[:, :, s + 1 : seq_len]], dim=2), torch.cat([v[:, :, :s], v[:, :, s + 1 : seq_len]], dim=2)] for k, v in past_key_values]
+ 
+ 
+-def _random_attention(torch: Any, layers: int, heads: int, q: int, k: int) -> List[Any]:
++def _random_attention(torch: Any, layers: int, heads: int, q: int, k: int, sharpness: float = 1.0) -> List[Any]:
+     """Causal softmax attention maps [1, H, q, k] for q new queries at the end of k keys."""
+-    logits = torch.randn(layers, heads, q, k)
++    logits = torch.randn(layers, heads, q, k) * sharpness
+     rows, cols = torch.arange(q)[:, None], torch.arange(k)[None, :]
+     logits = logits.masked_fill(cols > rows + (k - q), float("-inf"))
+     return [a.softmax(-1).unsqueeze(0) for a in logits]
+@@ -908,3 +908,199 @@ def test_elastic_multi_turn_decode_eviction_removes_entries_at_the_fixed_point(m
+     lengths = {p[0].shape[-2] for p in conv.cache}
+     assert lengths == {int(0.5 * len(conv.stream))}  # held at the budget while decoding
+     assert [f.numel() for f in conv.criteria.is_image] == [p[0].shape[-2] for p in conv.cache]
++
++
++# ---------------------------------------------------------------- H2O and Local cache
++
++
++class _OriginalH2OCache:
++    """H2OCache from github.com/liuzuyan/ElasticCache (kv_cache.py, MIT license), unchanged except `.cuda()` removed."""
++
++    def __init__(self, start_size=4, recent_size=512, k_seq_dim=2, v_seq_dim=2, ratio=0.0):
++        import torch
++
++        self.start_size = start_size
++        self.k_seq_dim = k_seq_dim
++        self.score_sum = torch.zeros(start_size + recent_size + 1)
++        self.ratio = ratio
++        self.protect_size = 1
++        self.flag = True
++
++    def __call__(self, past_key_values, num_of_token=None, attentions=None):
++        import torch
++
++        attn_score = [attention for attention in attentions]
++        past_key_values_new = tuple(x for x in past_key_values)
++        seq_len = past_key_values_new[0][0].size(self.k_seq_dim)
++        attn_score = torch.cat(attn_score, dim=0)
++        attn_score = attn_score.mean(dim=1, keepdim=False).mean(dim=0, keepdim=False)
++        if attn_score.shape[-2] > 1:
++            assert self.flag is True
++            for idx in range(attn_score.shape[-1]):
++                cur_score = attn_score[idx][: idx + 1]
++                self.score_sum[: len(cur_score)] += cur_score
++        else:
++            attn_score = attn_score.squeeze(0)
++            self.score_sum[:seq_len] += attn_score
++        forget_num = int(seq_len - num_of_token * (1 - self.ratio))
++        if forget_num <= 0:
++            return past_key_values_new
++        if forget_num > 1:
++            assert self.flag is True
++            self.flag = False
++            selected_idx = torch.where(torch.argsort(self.score_sum[: (seq_len - self.protect_size)]) > forget_num)[0]
++            selected_idx = torch.cat([selected_idx, torch.arange(seq_len - self.protect_size, seq_len)], dim=0)
++            out = []
++            for k, v in past_key_values_new:
++                k_new = k.gather(dim=-2, index=selected_idx.view(1, 1, -1, 1).expand(k.shape[0], k.shape[1], -1, k.shape[-1]))
++                v_new = v.gather(dim=-2, index=selected_idx.view(1, 1, -1, 1).expand(v.shape[0], v.shape[1], -1, v.shape[-1]))
++                out.append([k_new, v_new])
++            return out
++        selected_idx = self.score_sum[self.start_size : (seq_len - self.protect_size)].argmin() + self.start_size
++        self.score_sum[(selected_idx):-1] = self.score_sum[(selected_idx + 1) :].clone()
++        return [[torch.cat([k[:, :, :selected_idx], k[:, :, selected_idx + 1 : seq_len]], dim=2), torch.cat([v[:, :, :selected_idx], v[:, :, selected_idx + 1 : seq_len]], dim=2)] for k, v in past_key_values_new]
++
++
++def _original_local(past_key_values: Any, num_of_token: int, start_size: int, ratio: float) -> Any:
++    """LocalCache.__call__ from github.com/liuzuyan/ElasticCache (kv_cache.py, MIT license)."""
++    import torch
++
++    seq_len = past_key_values[0][0].size(2)
++    forget_num = int(seq_len - num_of_token * (1 - ratio))
++    if forget_num <= 0:
++        return past_key_values
++    return [[torch.cat([k[:, :, :start_size], k[:, :, forget_num + start_size : seq_len]], dim=2), torch.cat([v[:, :, :start_size], v[:, :, forget_num + start_size : seq_len]], dim=2)] for k, v in past_key_values]
++
++
++def _compare_with_original(torch: Any, original: Any, ours: Any, ratio: float) -> None:
++    """Prefill on 80 entries, then 30 decode steps with peaked attention (so decode scores change the ranking);
++    the caches must match after every step."""
++    torch.manual_seed(0)
++    layers, heads, n, dim = 3, 2, 80, 4
++    pkv = [[torch.randn(1, heads, n, dim), torch.randn(1, heads, n, dim)] for _ in range(layers)]
++    attn = _random_attention(torch, layers, heads, n, n, sharpness=4.0)
++    expected, got = original(pkv, n, attn), ours(pkv, n, attn)
++    for step in range(1, 31):
++        assert [a[0].shape for a in expected] == [b[0].shape for b in got]
++        assert all(torch.allclose(a[0], b[0]) and torch.allclose(a[1], b[1]) for a, b in zip(expected, got))
++        expected = [[torch.cat([k, torch.randn(1, heads, 1, dim)], 2), torch.cat([v, torch.randn(1, heads, 1, dim)], 2)] for k, v in expected]
++        got = [[a[0].clone(), a[1].clone()] for a in expected]
++        decode_attn = _random_attention(torch, layers, heads, 1, expected[0][0].shape[2], sharpness=4.0)
++        expected, got = original(expected, n + step, decode_attn), ours(got, n + step, decode_attn)
++
++
++@pytest.mark.parametrize("ratio", [0.5, 0.8])
++def test_h2o_official_selection_reproduces_the_original_code(ratio: float) -> None:
++    torch = pytest.importorskip("torch")
++    pytest.importorskip("transformers")
++    from kv_caches.h2o_cache import H2OCache
++
++    original = _OriginalH2OCache(start_size=1, recent_size=2047, ratio=ratio)
++    ours = H2OCache(layer_num=3, start_size=1, recent_size=2047, ratio=ratio, selection="official")
++    _compare_with_original(torch, original, ours, ratio)
++
++
++@pytest.mark.parametrize("ratio", [0.5, 0.8])
++def test_local_cache_reproduces_the_original_code(ratio: float) -> None:
++    torch = pytest.importorskip("torch")
++    pytest.importorskip("transformers")
++    from kv_caches.local_cache import LocalCache
++
++    ours = LocalCache(layer_num=3, start_size=1, ratio=ratio)
++    _compare_with_original(torch, lambda pkv, n, attn: _original_local(pkv, n, 1, ratio), ours, ratio)
++
++
++def test_h2o_paper_selection_keeps_the_top_scores_and_keeps_them_aligned() -> None:
++    torch = pytest.importorskip("torch")
++    pytest.importorskip("transformers")
++    from kv_caches.h2o_cache import H2OCache
++
++    cache = H2OCache(layer_num=1, start_size=1, ratio=0.5)
++    score = torch.tensor([9.0, 0.1, 0.9, 0.05, 0.2, 0.8, 0.3, 0.0])
++    keys = torch.arange(8.0).view(1, 1, 8, 1)
++    out = cache([[keys, keys.clone()]], 8, {"h2o_online_prefill": True, "scores": score})
++    assert out[0][0].view(-1).tolist() == [0.0, 2.0, 5.0, 7.0]  # sink, the 2 highest-scoring candidates, newest
++    assert cache.scores.tolist() == pytest.approx([9.0, 0.9, 0.8, 0.0])  # each score stays with its entry
++
++    # one decode step: entry 2 (now at index 1) gets no attention, entry 5 a lot -> the lowest score (index 1) goes
++    k = torch.cat([out[0][0], torch.full((1, 1, 1, 1), 8.0)], 2)
++    attention = torch.tensor([0.0, 0.0, 0.6, 0.2, 0.2]).view(1, 1, 1, 5)
++    out = cache([[k, k.clone()]], 9, (attention,))  # 5 entries, budget int(5 - 9 * 0.5) = 0 to forget -> no eviction yet
++    assert out[0][0].view(-1).tolist() == [0.0, 2.0, 5.0, 7.0, 8.0]
++    k = torch.cat([out[0][0], torch.full((1, 1, 1, 1), 9.0)], 2)
++    attention = torch.tensor([0.0, 0.0, 0.0, 0.5, 0.25, 0.25]).view(1, 1, 1, 6)
++    out = cache([[k, k.clone()]], 10, (attention,))  # 6 entries, budget 5: the lowest accumulated score among 2, 5, 7, 8 is 8's
++    assert out[0][0].view(-1).tolist() == [0.0, 2.0, 5.0, 7.0, 9.0]
++
++
++@pytest.mark.parametrize("method", ["h2o", "local"])
++def test_h2o_and_local_through_patched_generate_hold_the_budget(monkeypatch: pytest.MonkeyPatch, method: str) -> None:
++    monkeypatch.setenv("MODEL_TYPE", "llava-7B")
++    torch, model, first = _tiny_llava(num_layers=32)
++    import utils.generate_patches as patches
++    from kv_caches import get_kv_cache
++
++    created: List[Any] = []
++    monkeypatch.setattr(patches, "get_kv_cache", lambda *a, **k: created.append(get_kv_cache(method, prune_ratio=0.5)) or created[-1])
++    out = model.generate(**first, max_new_tokens=6, do_sample=False, return_dict_in_generate=True, pad_token_id=0)
++    n = first["input_ids"].shape[1]
++    assert {layer[0].shape[-2] for layer in out.past_key_values} == {int(0.5 * (n + 5))}
++
++
++def _carried_conversation(monkeypatch: pytest.MonkeyPatch, method: str, decode_eviction: str) -> Any:
++    monkeypatch.setenv("MODEL_TYPE", "llava-7B")
++    monkeypatch.setenv("KV_CACHE_TYPE", method)
++    monkeypatch.setenv("PRUNE_RATIO", "0.5")
++    monkeypatch.setenv("MULTI_TURN_DECODE_EVICTION", decode_eviction)
++    torch, model, first = _tiny_llava(num_layers=32)
++    from lmms_eval.models.model_utils.kv_carryover import CarryOverConversation
++
++    import utils.generate_patches as patches
++    from kv_caches import get_kv_cache
++
++    monkeypatch.setattr(patches, "get_kv_cache", get_kv_cache)
++    conv = CarryOverConversation(model, _IdsAdapter(first))
++    conv.start(first)
++    return model, conv
++
++
++@pytest.mark.parametrize("method", ["h2o", "local"])
++def test_h2o_and_local_multi_turn_compress_each_prefill_to_the_conversation_budget(monkeypatch: pytest.MonkeyPatch, method: str) -> None:
++    model, conv = _carried_conversation(monkeypatch, method, decode_eviction="0")
++    seen_inputs: List[List[int]] = []
++    hook = model.register_forward_pre_hook(lambda mod, args, kwargs: seen_inputs.append(kwargs["input_ids"][0].tolist()), with_kwargs=True)
++    conv.generate()
++    for ids in ([200, 201, 202, 203, 204, 205], [210, 211, 212, 213]):
++        expected_new = conv.pending + ids
++        conv.extend(ids)
++        seen_inputs.clear()
++        conv.generate()
++        assert seen_inputs[0] == expected_new  # the prefill processes only the new tokens
++        after_prefill = sum(conv.criteria.after_prefill)
++        assert after_prefill == math.ceil(0.5 * (len(conv.stream) - 5))
++        lengths = [p[0].shape[-2] for p in conv.cache]
++        assert lengths == [f.numel() for f in conv.criteria.is_image]
++        assert set(lengths) == {after_prefill + 5}  # decode eviction off: all 5 answer tokens kept
++        if method == "h2o":
++            assert conv.criteria.scores.numel() == lengths[0]  # one accumulated score per cached entry
++    hook.remove()
++
++
++@pytest.mark.parametrize("method", ["h2o", "local"])
++def test_h2o_and_local_multi_turn_decode_eviction_holds_the_budget(monkeypatch: pytest.MonkeyPatch, method: str) -> None:
++    model, conv = _carried_conversation(monkeypatch, method, decode_eviction="1")
++    conv.generate()
++    conv.extend([200, 201, 202, 203, 204, 205])
++    conv.generate()
++    assert {p[0].shape[-2] for p in conv.cache} == {int(0.5 * len(conv.stream))}
++    assert [f.numel() for f in conv.criteria.is_image] == [p[0].shape[-2] for p in conv.cache]
++
++
++def test_h2o_official_is_refused_for_multi_turn(monkeypatch: pytest.MonkeyPatch) -> None:
++    pytest.importorskip("transformers")
++    monkeypatch.setenv("MODEL_TYPE", "llava-7B")
++    monkeypatch.setenv("H2O_SELECTION", "official")
++    from kv_caches import get_kv_cache
++
++    with pytest.raises(ValueError, match="multi-turn runs need H2O_SELECTION=paper"):
++        get_kv_cache("h2o", prune_ratio=0.5, multi_turn=True)
+diff --git a/scripts/accuracy_convbench.sh b/scripts/accuracy_convbench.sh
+index 869d3b0..da73bc7 100755
+--- a/scripts/accuracy_convbench.sh
++++ b/scripts/accuracy_convbench.sh
+@@ -36,9 +36,10 @@ run() {
+ unset KV_CACHE_TYPE
+ run
+ 
+-# TGV-KV and Elastic Cache at several retention levels (PRUNE_RATIO=0.9 keeps 10% of the KV cache)
++# TGV-KV and the baselines (Elastic Cache, H2O, Local) at several retention levels (PRUNE_RATIO=0.9 keeps 10%)
+ # Elastic Cache options: ELASTIC_SELECTION=paper|official, ELASTIC_START_SIZE=1, ELASTIC_DISTANCE=-25
+-for method in tgv_kv elastic
++# H2O options: H2O_SELECTION=paper (official is single-turn only), H2O_START_SIZE=1; Local: LOCAL_START_SIZE=1
++for method in tgv_kv elastic h2o local
+ do
+   export KV_CACHE_TYPE=$method
+   for ratio in 0.5 0.8 0.9 0.95

@@ -559,6 +559,7 @@ def test_carryover_with_tgvkv_turn1_matches_original_and_flags_stay_in_sync(monk
     monkeypatch.setenv("KV_CACHE_TYPE", "tgv_kv")
     monkeypatch.setenv("PRUNE_RATIO", "0.5")
     monkeypatch.setenv("MULTI_TURN_DECODE_EVICTION", "1")
+    monkeypatch.setenv("MULTI_TURN_BUDGET", "conversation")  # the original's decode budget grows with the tokens
     torch, model, first = _tiny_llava(num_layers=32)
     from lmms_eval.models.model_utils.kv_carryover import CarryOverConversation
 
@@ -729,3 +730,399 @@ def test_debug_log_shows_one_block_per_turn_and_hides_ppl_scoring(monkeypatch: p
     assert "new question tokens 4 + 1 last token of the previous answer" in logged[1]
     prefill_2 = float(re.search(r"after prefill:  \(image [\d.]+, text ([\d.]+)\)", logged[1]).group(1))
     assert f"= text {kc._n(prefill_2)} + 5 answer tokens" in logged[1]
+
+
+# ---------------------------------------------------------------- Elastic Cache
+
+
+class _OriginalElasticCache:
+    """ElasticCache from github.com/liuzuyan/ElasticCache (kv_cache.py, MIT license), unchanged except that
+    `.cuda()` is removed so it runs on CPU. Used to check ELASTIC_SELECTION=official reproduces it exactly."""
+
+    def __init__(self, start_size=4, recent_size=512, k_seq_dim=2, v_seq_dim=2, ratio=0.0, distance=-25, layer_num=40):
+        import torch
+
+        self.start_size = start_size
+        self.cache_size = start_size + recent_size
+        self.k_seq_dim = k_seq_dim
+        self.score_sum = torch.zeros(layer_num, self.cache_size + 1)
+        self.ratio = ratio
+        self.protect_size = 1
+        self.flag = True
+        self.distance = distance
+        self.layer_num = layer_num
+        self.selected_idx = 0
+
+    def __call__(self, past_key_values, num_of_token=None, attentions=None):
+        import torch
+
+        attn_score = [attention for attention in attentions]
+        seq_len = past_key_values[0][0].size(self.k_seq_dim)
+        attn_score = torch.cat(attn_score, dim=0)
+        attn_score = attn_score.mean(dim=1, keepdim=False)
+        if attn_score.shape[-2] > 1:
+            assert self.flag is True
+            for idx in range(attn_score.shape[-1]):
+                cur_score = attn_score[:, idx, : idx + 1]
+                self.score_sum[:, : (cur_score.shape[-1])] += cur_score
+        forget_num = int(seq_len - num_of_token * (1 - self.ratio))
+        if forget_num <= 0:
+            return past_key_values
+        if forget_num > 1:
+            assert self.flag is True
+            self.flag = False
+            selected_idx_all, merge_idx_all, throw_idx_all = [], [], []
+            for idx in range(self.layer_num):
+                selected_idx = torch.where(torch.argsort(self.score_sum[idx, self.start_size : (seq_len - self.protect_size)]) > forget_num)[0] + self.start_size
+                throw_idx = torch.where(torch.argsort(self.score_sum[idx, self.start_size : (seq_len - self.protect_size)]) <= forget_num)[0]
+                merge_idx = []
+                for i in range(len(throw_idx)):
+                    merge_idx.append(selected_idx[torch.abs((selected_idx - throw_idx[i])).argmin()].unsqueeze(0))
+                merge_idx = torch.cat(merge_idx)
+                selected_idx = torch.cat([torch.arange(self.start_size), selected_idx, torch.tensor([seq_len - self.protect_size])], dim=0)
+                selected_idx_all.append(selected_idx)
+                merge_idx_all.append(merge_idx)
+                throw_idx_all.append(throw_idx)
+            self.selected_idx = self.distance if self.distance > 0 else seq_len - forget_num + self.distance
+            out = []
+            for idx, (k, v) in enumerate(past_key_values):
+                selected_idx, merge_idx, throw_idx = selected_idx_all[idx], merge_idx_all[idx], throw_idx_all[idx]
+                k_forget = k.gather(dim=-2, index=throw_idx.view(1, 1, -1, 1).expand(k.shape[0], k.shape[1], -1, k.shape[-1]))
+                v_forget = v.gather(dim=-2, index=throw_idx.view(1, 1, -1, 1).expand(v.shape[0], v.shape[1], -1, v.shape[-1]))
+                k = k.scatter_reduce(-2, merge_idx.view(1, 1, -1, 1).expand(k.shape[0], k.shape[1], -1, k.shape[-1]), k_forget, "mean")
+                v = v.scatter_reduce(-2, merge_idx.view(1, 1, -1, 1).expand(v.shape[0], v.shape[1], -1, v.shape[-1]), v_forget, "mean")
+                k_new = k.gather(dim=-2, index=selected_idx.view(1, 1, -1, 1).expand(k.shape[0], k.shape[1], -1, k.shape[-1]))
+                v_new = v.gather(dim=-2, index=selected_idx.view(1, 1, -1, 1).expand(v.shape[0], v.shape[1], -1, v.shape[-1]))
+                out.append([k_new, v_new])
+            return out
+        s = self.selected_idx
+        return [[torch.cat([k[:, :, :s], k[:, :, s + 1 : seq_len]], dim=2), torch.cat([v[:, :, :s], v[:, :, s + 1 : seq_len]], dim=2)] for k, v in past_key_values]
+
+
+def _random_attention(torch: Any, layers: int, heads: int, q: int, k: int, sharpness: float = 1.0) -> List[Any]:
+    """Causal softmax attention maps [1, H, q, k] for q new queries at the end of k keys."""
+    logits = torch.randn(layers, heads, q, k) * sharpness
+    rows, cols = torch.arange(q)[:, None], torch.arange(k)[None, :]
+    logits = logits.masked_fill(cols > rows + (k - q), float("-inf"))
+    return [a.softmax(-1).unsqueeze(0) for a in logits]
+
+
+@pytest.mark.parametrize("ratio", [0.5, 0.8])
+def test_elastic_official_selection_reproduces_the_original_code(ratio: float) -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from kv_caches.elastic_cache import ElasticCache
+
+    torch.manual_seed(0)
+    layers, heads, n, dim = 3, 2, 80, 4  # ratio 0.8: fixed point 80 - 64 - 25 < 0, which the original counts from the end
+    pkv = [[torch.randn(1, heads, n, dim), torch.randn(1, heads, n, dim)] for _ in range(layers)]
+    attn = _random_attention(torch, layers, heads, n, n)
+    original = _OriginalElasticCache(start_size=1, recent_size=100, ratio=ratio, layer_num=layers)
+    ours = ElasticCache(layer_num=layers, start_size=1, ratio=ratio, selection="official")
+
+    expected, got = original(pkv, n, attn), ours(pkv, n, attn)
+    assert all(torch.allclose(a[0], b[0]) and torch.allclose(a[1], b[1]) for a, b in zip(expected, got))
+    for step in range(1, 6):  # fixed-point elimination while decoding
+        expected = [[torch.cat([k, torch.randn(1, heads, 1, dim)], 2), torch.cat([v, torch.randn(1, heads, 1, dim)], 2)] for k, v in expected]
+        got = [[a[0].clone(), a[1].clone()] for a in expected]
+        decode_attn = _random_attention(torch, layers, heads, 1, expected[0][0].shape[2])
+        expected, got = original(expected, n + step, decode_attn), ours(got, n + step, decode_attn)
+        assert all(torch.equal(a[0], b[0]) for a, b in zip(expected, got))
+
+
+def test_elastic_paper_selection_keeps_the_most_important_entries_and_merges_into_the_nearest() -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from kv_caches.elastic_cache import ElasticCache
+
+    cache = ElasticCache(layer_num=1, start_size=1, ratio=0.5)
+    # 8 entries: sink 0, candidates 1..6, newest 7; importance below; budget 8 * 0.5 = 4 -> 2 candidates kept
+    score = torch.tensor([9.0, 0.1, 0.9, 0.05, 0.2, 0.8, 0.3, 0.0])
+    keys = torch.arange(8.0).view(1, 1, 8, 1)
+    out = cache([[keys, keys.clone()]], 8, {"elastic_online_prefill": True, "scores": (score,)})
+    kept = out[0][0].view(-1).tolist()
+    # kept: sink 0, candidates 2 and 5 (highest importance), newest 7; 1 and 3 merge into 2, 4 and 6 into 5
+    assert kept == [0.0, (2 + 1 + 3) / 3, (5 + 4 + 6) / 3, 7.0]
+    assert cache.fixed_point == 1  # 4 kept - 25, clamped to the first non-sink index
+
+
+def test_elastic_through_patched_generate_compresses_prefill_and_eliminates_at_a_fixed_point(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MODEL_TYPE", "llava-7B")
+    torch, model, first = _tiny_llava(num_layers=32)
+    import utils.generate_patches as patches
+    from kv_caches import get_kv_cache
+    from kv_caches.elastic_cache import ElasticCache
+
+    created: List[Any] = []
+    monkeypatch.setattr(patches, "get_kv_cache", lambda *a, **k: created.append(get_kv_cache("elastic", prune_ratio=0.5)) or created[-1])
+    out = model.generate(**first, max_new_tokens=6, do_sample=False, return_dict_in_generate=True, pad_token_id=0)
+    assert isinstance(created[0], ElasticCache)
+    n = first["input_ids"].shape[1]  # 19 prompt tokens; 5 generated tokens are in the cache
+    lengths = {layer[0].shape[-2] for layer in out.past_key_values}
+    assert lengths == {int(0.5 * (n + 5))}  # every layer at the budget, so compression and elimination ran
+
+
+# ---------------------------------------------------------------- H2O and Local cache
+
+
+class _OriginalH2OCache:
+    """H2OCache from github.com/liuzuyan/ElasticCache (kv_cache.py, MIT license), unchanged except `.cuda()` removed."""
+
+    def __init__(self, start_size=4, recent_size=512, k_seq_dim=2, v_seq_dim=2, ratio=0.0):
+        import torch
+
+        self.start_size = start_size
+        self.k_seq_dim = k_seq_dim
+        self.score_sum = torch.zeros(start_size + recent_size + 1)
+        self.ratio = ratio
+        self.protect_size = 1
+        self.flag = True
+
+    def __call__(self, past_key_values, num_of_token=None, attentions=None):
+        import torch
+
+        attn_score = [attention for attention in attentions]
+        past_key_values_new = tuple(x for x in past_key_values)
+        seq_len = past_key_values_new[0][0].size(self.k_seq_dim)
+        attn_score = torch.cat(attn_score, dim=0)
+        attn_score = attn_score.mean(dim=1, keepdim=False).mean(dim=0, keepdim=False)
+        if attn_score.shape[-2] > 1:
+            assert self.flag is True
+            for idx in range(attn_score.shape[-1]):
+                cur_score = attn_score[idx][: idx + 1]
+                self.score_sum[: len(cur_score)] += cur_score
+        else:
+            attn_score = attn_score.squeeze(0)
+            self.score_sum[:seq_len] += attn_score
+        forget_num = int(seq_len - num_of_token * (1 - self.ratio))
+        if forget_num <= 0:
+            return past_key_values_new
+        if forget_num > 1:
+            assert self.flag is True
+            self.flag = False
+            selected_idx = torch.where(torch.argsort(self.score_sum[: (seq_len - self.protect_size)]) > forget_num)[0]
+            selected_idx = torch.cat([selected_idx, torch.arange(seq_len - self.protect_size, seq_len)], dim=0)
+            out = []
+            for k, v in past_key_values_new:
+                k_new = k.gather(dim=-2, index=selected_idx.view(1, 1, -1, 1).expand(k.shape[0], k.shape[1], -1, k.shape[-1]))
+                v_new = v.gather(dim=-2, index=selected_idx.view(1, 1, -1, 1).expand(v.shape[0], v.shape[1], -1, v.shape[-1]))
+                out.append([k_new, v_new])
+            return out
+        selected_idx = self.score_sum[self.start_size : (seq_len - self.protect_size)].argmin() + self.start_size
+        self.score_sum[(selected_idx):-1] = self.score_sum[(selected_idx + 1) :].clone()
+        return [[torch.cat([k[:, :, :selected_idx], k[:, :, selected_idx + 1 : seq_len]], dim=2), torch.cat([v[:, :, :selected_idx], v[:, :, selected_idx + 1 : seq_len]], dim=2)] for k, v in past_key_values_new]
+
+
+def _original_local(past_key_values: Any, num_of_token: int, start_size: int, ratio: float) -> Any:
+    """LocalCache.__call__ from github.com/liuzuyan/ElasticCache (kv_cache.py, MIT license)."""
+    import torch
+
+    seq_len = past_key_values[0][0].size(2)
+    forget_num = int(seq_len - num_of_token * (1 - ratio))
+    if forget_num <= 0:
+        return past_key_values
+    return [[torch.cat([k[:, :, :start_size], k[:, :, forget_num + start_size : seq_len]], dim=2), torch.cat([v[:, :, :start_size], v[:, :, forget_num + start_size : seq_len]], dim=2)] for k, v in past_key_values]
+
+
+def _compare_with_original(torch: Any, original: Any, ours: Any, ratio: float) -> None:
+    """Prefill on 80 entries, then 30 decode steps with peaked attention (so decode scores change the ranking);
+    the caches must match after every step."""
+    torch.manual_seed(0)
+    layers, heads, n, dim = 3, 2, 80, 4
+    pkv = [[torch.randn(1, heads, n, dim), torch.randn(1, heads, n, dim)] for _ in range(layers)]
+    attn = _random_attention(torch, layers, heads, n, n, sharpness=4.0)
+    expected, got = original(pkv, n, attn), ours(pkv, n, attn)
+    for step in range(1, 31):
+        assert [a[0].shape for a in expected] == [b[0].shape for b in got]
+        assert all(torch.allclose(a[0], b[0]) and torch.allclose(a[1], b[1]) for a, b in zip(expected, got))
+        expected = [[torch.cat([k, torch.randn(1, heads, 1, dim)], 2), torch.cat([v, torch.randn(1, heads, 1, dim)], 2)] for k, v in expected]
+        got = [[a[0].clone(), a[1].clone()] for a in expected]
+        decode_attn = _random_attention(torch, layers, heads, 1, expected[0][0].shape[2], sharpness=4.0)
+        expected, got = original(expected, n + step, decode_attn), ours(got, n + step, decode_attn)
+
+
+@pytest.mark.parametrize("ratio", [0.5, 0.8])
+def test_h2o_official_selection_reproduces_the_original_code(ratio: float) -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from kv_caches.h2o_cache import H2OCache
+
+    original = _OriginalH2OCache(start_size=1, recent_size=2047, ratio=ratio)
+    ours = H2OCache(layer_num=3, start_size=1, recent_size=2047, ratio=ratio, selection="official")
+    _compare_with_original(torch, original, ours, ratio)
+
+
+@pytest.mark.parametrize("ratio", [0.5, 0.8])
+def test_local_cache_reproduces_the_original_code(ratio: float) -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from kv_caches.local_cache import LocalCache
+
+    ours = LocalCache(layer_num=3, start_size=1, ratio=ratio)
+    _compare_with_original(torch, lambda pkv, n, attn: _original_local(pkv, n, 1, ratio), ours, ratio)
+
+
+def test_h2o_paper_selection_keeps_the_top_scores_and_keeps_them_aligned() -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from kv_caches.h2o_cache import H2OCache
+
+    cache = H2OCache(layer_num=1, start_size=1, ratio=0.5)
+    score = torch.tensor([9.0, 0.1, 0.9, 0.05, 0.2, 0.8, 0.3, 0.0])
+    keys = torch.arange(8.0).view(1, 1, 8, 1)
+    out = cache([[keys, keys.clone()]], 8, {"h2o_online_prefill": True, "scores": score})
+    assert out[0][0].view(-1).tolist() == [0.0, 2.0, 5.0, 7.0]  # sink, the 2 highest-scoring candidates, newest
+    assert cache.scores.tolist() == pytest.approx([9.0, 0.9, 0.8, 0.0])  # each score stays with its entry
+
+    # one decode step: entry 2 (now at index 1) gets no attention, entry 5 a lot -> the lowest score (index 1) goes
+    k = torch.cat([out[0][0], torch.full((1, 1, 1, 1), 8.0)], 2)
+    attention = torch.tensor([0.0, 0.0, 0.6, 0.2, 0.2]).view(1, 1, 1, 5)
+    out = cache([[k, k.clone()]], 9, (attention,))  # 5 entries, budget int(5 - 9 * 0.5) = 0 to forget -> no eviction yet
+    assert out[0][0].view(-1).tolist() == [0.0, 2.0, 5.0, 7.0, 8.0]
+    k = torch.cat([out[0][0], torch.full((1, 1, 1, 1), 9.0)], 2)
+    attention = torch.tensor([0.0, 0.0, 0.0, 0.5, 0.25, 0.25]).view(1, 1, 1, 6)
+    out = cache([[k, k.clone()]], 10, (attention,))  # 6 entries, budget 5: the lowest accumulated score among 2, 5, 7, 8 is 8's
+    assert out[0][0].view(-1).tolist() == [0.0, 2.0, 5.0, 7.0, 9.0]
+
+
+@pytest.mark.parametrize("method", ["h2o", "local"])
+def test_h2o_and_local_through_patched_generate_hold_the_budget(monkeypatch: pytest.MonkeyPatch, method: str) -> None:
+    monkeypatch.setenv("MODEL_TYPE", "llava-7B")
+    torch, model, first = _tiny_llava(num_layers=32)
+    import utils.generate_patches as patches
+    from kv_caches import get_kv_cache
+
+    created: List[Any] = []
+    monkeypatch.setattr(patches, "get_kv_cache", lambda *a, **k: created.append(get_kv_cache(method, prune_ratio=0.5)) or created[-1])
+    out = model.generate(**first, max_new_tokens=6, do_sample=False, return_dict_in_generate=True, pad_token_id=0)
+    n = first["input_ids"].shape[1]
+    assert {layer[0].shape[-2] for layer in out.past_key_values} == {int(0.5 * (n + 5))}
+
+
+def test_h2o_official_is_refused_for_multi_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("transformers")
+    monkeypatch.setenv("MODEL_TYPE", "llava-7B")
+    monkeypatch.setenv("H2O_SELECTION", "official")
+    from kv_caches import get_kv_cache
+
+    with pytest.raises(ValueError, match="multi-turn runs need H2O_SELECTION=paper"):
+        get_kv_cache("h2o", prune_ratio=0.5, multi_turn=True)
+
+
+# ---------------------------------------------------------------- multi-turn budget, all methods
+
+
+def _carried_conversation(monkeypatch: pytest.MonkeyPatch, method: str, decode_eviction: str = "0", budget: str = "fixed", answer_tokens: int = 6) -> Any:
+    monkeypatch.setenv("MODEL_TYPE", "llava-7B")
+    monkeypatch.setenv("KV_CACHE_TYPE", method)
+    monkeypatch.setenv("PRUNE_RATIO", "0.5")
+    monkeypatch.setenv("MULTI_TURN_DECODE_EVICTION", decode_eviction)
+    monkeypatch.setenv("MULTI_TURN_BUDGET", budget)
+    torch, model, first = _tiny_llava(num_layers=32)
+    from lmms_eval.models.model_utils.kv_carryover import CarryOverConversation
+
+    import utils.generate_patches as patches
+    from kv_caches import get_kv_cache
+
+    monkeypatch.setattr(patches, "get_kv_cache", get_kv_cache)
+    adapter = _IdsAdapter(first)
+    adapter.generate_kwargs["max_new_tokens"] = answer_tokens
+    conv = CarryOverConversation(model, adapter)
+    conv.start(first)
+    return model, conv, first["input_ids"].shape[1]
+
+
+def _kept_after_prefill(conv: Any) -> float:
+    return sum(conv.criteria.after_prefill)
+
+
+METHODS = ["tgv_kv", "elastic", "h2o", "local"]
+
+
+@pytest.mark.parametrize("method", METHODS)
+@pytest.mark.parametrize("budget", ["fixed", "conversation"])
+def test_multi_turn_prefills_compress_to_the_budget(monkeypatch: pytest.MonkeyPatch, method: str, budget: str) -> None:
+    """fixed: every prefill keeps the turn-1 budget; conversation: (1 - ratio) x the conversation so far."""
+    model, conv, n1 = _carried_conversation(monkeypatch, method, budget=budget)
+    seen_inputs: List[List[int]] = []
+    hook = model.register_forward_pre_hook(lambda mod, args, kwargs: seen_inputs.append(kwargs["input_ids"][0].tolist()), with_kwargs=True)
+    conv.generate()
+    for ids in ([200, 201, 202, 203, 204, 205], [210, 211, 212, 213]):
+        expected_new = conv.pending + ids
+        conv.extend(ids)
+        seen_inputs.clear()
+        conv.generate()
+        assert seen_inputs[0] == expected_new  # the prefill processes only the new tokens
+        target = 0.5 * n1 if budget == "fixed" else 0.5 * (len(conv.stream) - 5)
+        assert conv.criteria.last_target == pytest.approx(target)
+        if method == "tgv_kv":  # per-layer budgets (TVB), each rounded: the mean is within half an entry
+            assert abs(_kept_after_prefill(conv) - target) <= 0.5
+        else:
+            assert _kept_after_prefill(conv) == math.ceil(target)
+        lengths = [p[0].shape[-2] for p in conv.cache]
+        assert lengths == [f.numel() for f in conv.criteria.is_image]  # flags in sync with every layer
+        assert sum(lengths) / len(lengths) == pytest.approx(_kept_after_prefill(conv) + 5)  # all 5 answer tokens kept
+    hook.remove()
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_fixed_budget_does_not_depend_on_the_previous_answer_length(monkeypatch: pytest.MonkeyPatch, method: str) -> None:
+    kept = []
+    for answer_tokens in (3, 9):
+        model, conv, n1 = _carried_conversation(monkeypatch, method, answer_tokens=answer_tokens)
+        conv.generate()
+        conv.extend([200, 201, 202, 203, 204, 205])
+        conv.generate()
+        kept.append(_kept_after_prefill(conv))
+    assert kept[0] == pytest.approx(kept[1], abs=0.5 if method == "tgv_kv" else 0)
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_multi_turn_decode_eviction_holds_the_fixed_budget(monkeypatch: pytest.MonkeyPatch, method: str) -> None:
+    model, conv, n1 = _carried_conversation(monkeypatch, method, decode_eviction="1")
+    conv.generate()
+    conv.extend([200, 201, 202, 203, 204, 205])
+    conv.generate()
+    lengths = [p[0].shape[-2] for p in conv.cache]
+    assert [f.numel() for f in conv.criteria.is_image] == lengths
+    if method == "tgv_kv":
+        assert abs(sum(lengths) / len(lengths) - 0.5 * n1) <= 1.5  # per-layer budgets, each held while decoding
+    else:
+        assert set(lengths) == {math.ceil(0.5 * n1)}
+
+
+def test_tgv_kv_budget_a_full_layer_cannot_use_goes_to_the_other_layers() -> None:
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("transformers")
+    from kv_caches.tgv_kv_multiturn import _allocate
+
+    # 4 layers share 40 entries 70/10/10/10 (28/4/4/4), but the first holds only 20: its other 8 go to the rest
+    keep = _allocate(40, [0.7, 0.1, 0.1, 0.1], [20, 50, 50, 50])
+    assert keep.tolist() == pytest.approx([20, 4 + 8 / 3, 4 + 8 / 3, 4 + 8 / 3])
+    assert keep.sum() == pytest.approx(40)
+    assert _allocate(500, [0.25] * 4, [20, 50, 50, 50]).tolist() == [20, 50, 50, 50]  # more than they all hold
+
+
+def test_tgv_kv_later_prefill_reaches_the_budget_when_a_few_layers_dominate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: with text-to-image attention concentrated in a few layers, those layers were offered more entries
+    than they hold and the excess was lost (44 kept per layer instead of 171)."""
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    monkeypatch.setenv("MODEL_TYPE", "llava-7B")
+    from kv_caches import get_kv_cache
+
+    cache = get_kv_cache("tgv_kv", prune_ratio=0.8, multi_turn=True)
+    layers, cached, new = cache.layer_num, 236, 25
+    cache.budget = 171.2  # as if turn 1 kept 171.2 per layer
+    cache.is_image = [torch.cat([torch.ones(36, dtype=torch.bool), torch.zeros(cached - 36, dtype=torch.bool)]) for _ in range(layers)]
+    pkv = transformers.cache_utils.DynamicCache([[torch.randn(1, 2, cached + new, 4), torch.randn(1, 2, cached + new, 4)] for _ in range(layers)])
+    stats = {
+        "new_is_image": torch.zeros(new, dtype=torch.bool),
+        "score_sums": [torch.rand(1, cached + new) for _ in range(layers)],
+        "text_image_attn_sums": list(torch.tensor([10.0] * 4 + [0.1] * (layers - 4))),
+    }
+    cache.initial_text_len_list = []
+    out = cache._prefill_history(pkv, 856, stats)
+    kept = [p[0].shape[-2] for p in out]
+    assert kept[:4] == [cached + new] * 4  # the dominant layers keep everything they hold
+    assert abs(sum(kept) / layers - 171.2) <= 0.5  # and the rest of the budget goes to the other layers

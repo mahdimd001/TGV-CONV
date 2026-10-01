@@ -1,0 +1,200 @@
+{
+  "results": {
+    "convbench": {
+      "alias": "convbench"
+    }
+  },
+  "group_subtasks": {
+    "convbench": []
+  },
+  "configs": {
+    "convbench": {
+      "task": "convbench",
+      "dataset_path": "json",
+      "dataset_kwargs": {
+        "data_files": {
+          "test": "/lustre/hdd/LAS/jannesar-lab/msamani/TGV-CONV/lmms-eval/lmms_eval/tasks/convbench/convbench.jsonl"
+        }
+      },
+      "test_split": "test",
+      "full_docs": false,
+      "process_results_use_image": false,
+      "process_docs": "<function convbench_process_docs at 0x151398159240>",
+      "doc_to_visual": "<function convbench_doc_to_visual at 0x15139815b370>",
+      "doc_to_text": "<function convbench_doc_to_text at 0x15139816d510>",
+      "doc_to_target": "reference_3",
+      "process_results": "<function convbench_process_results at 0x15139ad9ab00>",
+      "description": "",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "convbench_R1",
+          "aggregation": "<function convbench_aggregate_r1 at 0x15139ae25360>",
+          "higher_is_better": true
+        },
+        {
+          "metric": "convbench_R2",
+          "aggregation": "<function convbench_aggregate_r2 at 0x15139ae27370>",
+          "higher_is_better": true
+        },
+        {
+          "metric": "convbench_S0",
+          "aggregation": "<function convbench_aggregate_score at 0x15139ae39360>",
+          "higher_is_better": true
+        },
+        {
+          "metric": "convbench_S1",
+          "aggregation": "<function convbench_aggregate_score at 0x15139ae3b400>",
+          "higher_is_better": true
+        },
+        {
+          "metric": "convbench_S2",
+          "aggregation": "<function convbench_aggregate_score at 0x15139ae59510>",
+          "higher_is_better": true
+        },
+        {
+          "metric": "convbench_S3",
+          "aggregation": "<function convbench_aggregate_score at 0x15139ae5b5b0>",
+          "higher_is_better": true
+        },
+        {
+          "metric": "convbench_BLEU1",
+          "aggregation": "<function convbench_bleu1 at 0x15139ae69ab0>",
+          "higher_is_better": true
+        },
+        {
+          "metric": "convbench_BLEU2",
+          "aggregation": "<function convbench_bleu2 at 0x15139ae6bbe0>",
+          "higher_is_better": true
+        },
+        {
+          "metric": "convbench_BLEU3",
+          "aggregation": "<function convbench_bleu3 at 0x1513980f9d80>",
+          "higher_is_better": true
+        },
+        {
+          "metric": "convbench_BLEU4",
+          "aggregation": "<function convbench_bleu4 at 0x1513980fbeb0>",
+          "higher_is_better": true
+        },
+        {
+          "metric": "convbench_METEOR",
+          "aggregation": "<function convbench_meteor at 0x15139810a050>",
+          "higher_is_better": true
+        },
+        {
+          "metric": "convbench_ROUGE_L",
+          "aggregation": "<function convbench_rouge_l at 0x1513981301f0>",
+          "higher_is_better": true
+        },
+        {
+          "metric": "convbench_PPL",
+          "aggregation": "<function convbench_aggregate_ppl at 0x151398132440>",
+          "higher_is_better": false
+        },
+        {
+          "metric": "convbench_PPL_turn1",
+          "aggregation": "<function convbench_aggregate_ppl_turn1 at 0x1513981485e0>",
+          "higher_is_better": false
+        },
+        {
+          "metric": "convbench_PPL_turn2",
+          "aggregation": "<function convbench_aggregate_ppl_turn2 at 0x15139814a710>",
+          "higher_is_better": false
+        },
+        {
+          "metric": "convbench_PPL_turn3",
+          "aggregation": "<function convbench_aggregate_ppl_turn3 at 0x1513981588b0>",
+          "higher_is_better": false
+        }
+      ],
+      "output_type": "generate_until_multi_round",
+      "generation_kwargs": {
+        "max_new_tokens": 1024,
+        "temperature": 0.0,
+        "top_p": null,
+        "num_beams": 1,
+        "do_sample": false,
+        "until": [
+          "\n\n"
+        ]
+      },
+      "repeats": 1,
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 0.1
+      },
+      "lmms_eval_specific_kwargs": {
+        "default": {
+          "n_ref_turns": 0
+        },
+        "n_ref_turns": 0
+      }
+    }
+  },
+  "versions": {
+    "convbench": 0.1
+  },
+  "n-shot": {
+    "convbench": 0
+  },
+  "higher_is_better": {
+    "convbench": {
+      "convbench_R1": true,
+      "convbench_R2": true,
+      "convbench_S0": true,
+      "convbench_S1": true,
+      "convbench_S2": true,
+      "convbench_S3": true,
+      "convbench_BLEU1": true,
+      "convbench_BLEU2": true,
+      "convbench_BLEU3": true,
+      "convbench_BLEU4": true,
+      "convbench_METEOR": true,
+      "convbench_ROUGE_L": true,
+      "convbench_PPL": false,
+      "convbench_PPL_turn1": false,
+      "convbench_PPL_turn2": false,
+      "convbench_PPL_turn3": false
+    }
+  },
+  "n-samples": {
+    "convbench": {
+      "original": 577,
+      "effective": 10
+    }
+  },
+  "config": {
+    "model": "llava_hf",
+    "model_args": "pretrained=llava-hf/llava-1.5-7b-hf,attn_implementation=eager,device_map=cuda",
+    "batch_size": "1",
+    "batch_sizes": [],
+    "device": null,
+    "use_cache": null,
+    "limit": 10.0,
+    "bootstrap_iters": 100000,
+    "gen_kwargs": "",
+    "random_seed": 0,
+    "numpy_seed": 1234,
+    "torch_seed": 1234,
+    "fewshot_seed": 1234
+  },
+  "git_hash": "c442d80",
+  "date": "20261001_102337",
+  "task_hashes": {
+    "convbench": "709f0b7377fd6759d028a71dbbcf430f06cf2579d36790892ad9f20a36d70be1"
+  },
+  "model_source": "llava_hf",
+  "model_name": "llava-hf/llava-1.5-7b-hf",
+  "model_name_sanitized": "llava-hf__llava-1.5-7b-hf",
+  "system_instruction": null,
+  "system_instruction_sha": null,
+  "fewshot_as_multiturn": false,
+  "chat_template": null,
+  "chat_template_sha": null,
+  "start_time": 3722053.361725517,
+  "end_time": 3722295.080242478,
+  "total_evaluation_time_seconds": "241.7185169607401"
+}

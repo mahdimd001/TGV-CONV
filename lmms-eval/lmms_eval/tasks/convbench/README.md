@@ -77,12 +77,34 @@ How TGV-KV compresses a carried cache (`kv_caches/tgv_kv_multiturn.py`):
 - It tracks, for every layer, which cached entries are image tokens, because each layer keeps a different subset.
 - Image entries are ranked by text-weighted attention from the new text tokens (TWR), and text entries are kept first (TPR).
 - Layer budgets follow the new tokens' text-to-image attention (TVB).
-- The budget is **(1 − `PRUNE_RATIO`) × all tokens of the conversation so far**. This is the rule TGV-KV's decode step already uses, so memory stays at the same fraction of a full cache in every turn.
+- Layer budgets follow the new tokens' text-to-image attention (TVB). When a layer is offered more entries than it holds, it keeps all of them and the rest of its share goes to the other layers, so the budget is actually reached.
+
+How Elastic Cache (`KV_CACHE_TYPE=elastic`, [Liu et al., ECCV 2024](https://github.com/liuzuyan/ElasticCache); `kv_caches/elastic_cache.py`) compresses a carried cache:
+
+- At every prefill, each cached entry's importance is the attention it receives from the tokens processed in that prefill (turn 1: the image and Q1; later turns: the new question), averaged over heads and summed over those tokens.
+- Each layer keeps its most important entries, plus 1 sink entry (`ELASTIC_START_SIZE`) and the newest entry. Every other entry is merged (averaged) into its nearest kept entry instead of being discarded.
+- All layers get the same budget (see "Budget" below).
+- While decoding, Elastic Cache's fixed-point elimination deletes the entry at one fixed index (the compressed length + `ELASTIC_DISTANCE`, default −25) whenever the cache is over budget. In multi-turn runs this follows `MULTI_TURN_DECODE_EVICTION` below.
+- `ELASTIC_SELECTION=paper` (default) keeps the highest-importance entries, as the paper describes. `ELASTIC_SELECTION=official` reproduces the authors' code exactly (tested against it): it ranks entries with a single `argsort`, which keeps the highest-importance entries only when importance falls steadily with position.
+
+H2O (`KV_CACHE_TYPE=h2o`, `kv_caches/h2o_cache.py`) and Local cache (`KV_CACHE_TYPE=local`, `kv_caches/local_cache.py`) are the two baselines of the Elastic Cache repository, carried across turns the same way:
+
+- **H2O:** every entry carries an accumulated score, the attention it receives (averaged over heads and layers) summed over every token processed so far, prompt and answers. Each prefill adds the new question's attention to the carried scores and keeps the highest-scoring entries, plus 1 sink (`H2O_START_SIZE`) and the newest entry. While decoding, the scores keep accumulating and, with decode eviction, the lowest-scoring entry is evicted. All layers keep the same entries.
+  - `H2O_SELECTION=paper` (default) keeps the highest-scoring entries and keeps each score with its entry. `H2O_SELECTION=official` reproduces the original code exactly (tested against it), including its `argsort` ranking and a score buffer that is not compacted after the prefill, so its decode-time scores belong to other entries. It does not support multi-turn runs.
+- **Local:** a sliding window. It keeps 1 sink (`LOCAL_START_SIZE`) and the most recent entries, dropping the oldest ones; it needs no attention weights. The image is the oldest part of a conversation, so it is dropped first: at `PRUNE_RATIO=0.8` it is usually gone after turn 1's prefill.
+- Both use the same budget as the other methods (see "Budget" below).
+
+**Budget** (all methods), set by `MULTI_TURN_BUDGET`:
+
+- `fixed` (default): the budget is set once, at turn 1's prefill: (1 − `PRUNE_RATIO`) × the turn-1 prompt (image + Q1), per layer on average. Every later prefill compresses the cache back to that same size, so a long answer does not give the next turn more cache. Answers are kept in full until the next prefill, unless decode eviction is on, in which case the cache is held at the budget while they are generated.
+- `conversation`: (1 − `PRUNE_RATIO`) × all tokens of the conversation so far, so the budget grows with every question and answer (the rule of TGV-KV's single-turn decode step).
+
+`CONVBENCH_DEBUG_PROMPTS=1` prints the budget on each turn's "after prefill" line.
 
 `MULTI_TURN_DECODE_EVICTION` controls eviction while an answer is being generated:
 
 - `0` (default): no eviction during generation. Answers are kept in full until the next turn's prefill compresses them along with everything else.
-- `1`: TGV-KV's usual eviction of one entry per decode step, as in its single-turn code, so answers are compressed while they are generated.
+- `1`: the method's usual decode eviction, as in its single-turn code, so answers are compressed while they are generated: TGV-KV evicts the lowest-attention entry at each step, Elastic Cache the entry at its fixed point, H2O the lowest accumulated score, Local the oldest entry after the sink.
 
 The ablation tasks (`convbench_ref1` and `convbench_ref2`) teacher-force the reference answers as the earlier turns, so the cache holds exactly what the history says. For PPL, each reference is forced on a copy of the conversation's cache, right before the model's answer to that turn (`PPL_HISTORY=model`), or after the compressed reference history (`PPL_HISTORY=reference`).
 
@@ -97,11 +119,11 @@ Carrying the cache needs `attn_implementation=eager`, and a chat template that r
 ```
 conversation 1, turn 2
   before prefill: (image 90, text 57) (new question tokens 36)
-  after prefill:  (image 41, text 75)
-  after answer: (image 41, text 194) = text 75 + 119 answer tokens
+  after prefill:  (image 41, text 80) (budget 121.2)
+  after answer: (image 41, text 199) = text 80 + 119 answer tokens
 ```
 
-- Counts are KV-cache entries per layer, averaged over the layers: TGV-KV keeps a different subset in each layer, so they can have a decimal.
+- Counts are KV-cache entries per layer, averaged over the layers: each layer keeps a different subset, so they can have a decimal.
 - "text" after the prefill includes the new question; "text" before the next turn's prefill equals "text" after this answer.
 - The new tokens of turns 2 and 3 are only the question with its chat-template markers, never image tokens: the image was processed once in turn 1 and stays in the cache in compressed form.
 - An answer cut by the token limit has its last token processed with the next question; the log then says "+ 1 last token of the previous answer".

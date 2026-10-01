@@ -2,7 +2,7 @@ print(33)
 
 export PYTHONPATH="$(pwd)/lmms-eval:$PYTHONPATH"
 
-
+tgv
 decode eviction 0
 |  Tasks  |Version|Filter|n-shot|      Metric       |   |Value|   |Stderr|
 |---------|------:|------|-----:|-------------------|---|----:|---|------|
@@ -11,7 +11,7 @@ decode eviction 0
 |convbench|    0.1|none  |     0|convbench_PPL_turn2|↓  |4.257|±  |   N/A|
 |convbench|    0.1|none  |     0|convbench_PPL_turn3|↓  |4.037|±  |   N/A|
 
-
+tgv
 decode eviction 1
 |  Tasks  |Version|Filter|n-shot|      Metric       |   |Value |   |Stderr|
 |---------|------:|------|-----:|-------------------|---|-----:|---|------|
@@ -19,3 +19,8 @@ decode eviction 1
 |convbench|    0.1|none  |     0|convbench_PPL_turn1|↓  | 5.481|±  |   N/A|
 |convbench|    0.1|none  |     0|convbench_PPL_turn2|↓  | 4.541|±  |   N/A|
 |convbench|    0.1|none  |     0|convbench_PPL_turn3|↓  |10.208|±  |   N/A|
+
+
+
+elasti
+decode eviction 0
